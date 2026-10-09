@@ -1,0 +1,537 @@
+app/repositories/product_repository.py
+from app.models import Category, Product
+    async def search(
+        self,
+        *,
+        text: str | None = None,
+        category_id: int | None = None,
+        min_price: Decimal | None = None,
+        max_price: Decimal | None = None,
+        skip: int = 0,
+        limit: int = 20,
+    ) -> list[Product]:
+        """Active products matching every filter. `text` searches name, description and category name."""
+        query = select(Product).join(Category, Category.id == Product.category_id).where(Product.is_active.is_(True))
+        if text:
+            pattern = f"%{text}%"
+            query = query.where(
+                or_(Product.name.ilike(pattern), Product.description.ilike(pattern), Category.name.ilike(pattern))
+            )
+        if category_id is not None:
+            query = query.where(Product.category_id == category_id)
+        if min_price is not None:
+            query = query.where(Product.price >= min_price)
+        if max_price is not None:
+            query = query.where(Product.price <= max_price)
+        query = query.order_by(Product.name).offset(skip).limit(limit)
+        return list(await self.db.scalars(query))
+
+
+src/api/productApi.js
+/** Product and category endpoints (backend: app/routes/products.py). Public: no token needed. */
+import { apiRequest } from "./client";
+
+const PAGE_SIZE = 100; // the backend's maximum page size
+
+/** GET /api/products?category_id= - active products. */
+export function fetchProducts({ categoryId } = {}) {
+  return apiRequest("/api/products", { auth: false, query: { category_id: categoryId, limit: PAGE_SIZE } });
+}
+
+/** GET /api/products/search?q=&category_id= - text matches name, description or category name. */
+export function searchProducts({ text, categoryId } = {}) {
+  return apiRequest("/api/products/search", {
+    auth: false,
+    query: { q: text, category_id: categoryId, limit: PAGE_SIZE },
+  });
+}
+
+/** GET /api/products/{id} */
+export function fetchProduct(productId) {
+  return apiRequest(`/api/products/${productId}`, { auth: false });
+}
+
+/** GET /api/categories - active categories, used for names and the dropdown. */
+export function fetchCategories() {
+  return apiRequest("/api/categories", { auth: false });
+}
+
+src/api/cartApi.js
+/** Cart endpoints (backend: app/routes/cart.py). Customer token required. */
+import { apiRequest } from "./client";
+
+/** GET /api/cart -> { items: [...], total_items, total } */
+export function fetchCart() {
+  return apiRequest("/api/cart");
+}
+
+/** POST /api/cart/add - adding a product already in the cart increases its quantity. */
+export function addToCart(productId, quantity = 1) {
+  return apiRequest("/api/cart/add", { method: "POST", body: { product_id: productId, quantity } });
+}
+
+/** PUT /api/cart/update/{cart_item_id} - sets the NEW quantity. */
+export function updateCartItem(cartItemId, quantity) {
+  return apiRequest(`/api/cart/update/${cartItemId}`, { method: "PUT", body: { quantity } });
+}
+
+/** DELETE /api/cart/remove/{cart_item_id} - 204, no body. */
+export function removeCartItem(cartItemId) {
+  return apiRequest(`/api/cart/remove/${cartItemId}`, { method: "DELETE" });
+}
+
+src/hooks/useDebouncedValue.js
+/**
+ * useDebouncedValue: returns `value` only after it stopped changing for `delayMs`.
+ * The product search uses it so typing "head" sends ONE request, not four.
+ */
+import { useEffect, useState } from "react";
+
+export function useDebouncedValue(value, delayMs = 300) {
+  const [debounced, setDebounced] = useState(value);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebounced(value), delayMs);
+    return () => clearTimeout(timer); // a new keystroke cancels the previous timer
+  }, [value, delayMs]);
+
+  return debounced;
+}
+
+
+src/hooks/useAddToCart.js 
+/**
+ * useAddToCart: what an "Add to Cart" button does, shared by the listing and details pages.
+ *
+ * - Guest -> send to the login page (and come back here afterwards). Returns false.
+ * - Logged in, but not a customer (admin/support) -> error: only customers have a cart.
+ * - Customer -> POST /api/cart/add. Returns true.
+ *
+ * Milestone 3 replaces the direct API call with the CartContext, so the header's cart
+ * badge updates too.
+ */
+import { useCallback } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { addToCart } from "../api/cartApi";
+import { useAuth } from "../context/AuthContext";
+
+export function useAddToCart() {
+  const { isLoggedIn, isCustomer } = useAuth();
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  return useCallback(
+    async (product, quantity = 1) => {
+      if (!isLoggedIn) {
+        navigate("/login", { state: { from: location.pathname, message: "Please log in to add items to your cart." } });
+        return false;
+      }
+      if (!isCustomer) throw new Error("Only customer accounts can add items to a cart.");
+      await addToCart(product.id, quantity);
+      return true;
+    },
+    [isLoggedIn, isCustomer, navigate, location.pathname],
+  );
+}
+
+
+src/utils/format.js
+/** Display helpers: prices in rupees, readable dates. */
+
+const priceFormatter = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" });
+const dateFormatter = new Intl.DateTimeFormat("en-IN", { dateStyle: "medium" });
+
+export function formatPrice(amount) {
+  return priceFormatter.format(Number(amount) || 0);
+}
+
+/** The backend sends UTC timestamps; ones without a zone (SQLite) are treated as UTC. */
+export function formatDate(isoText) {
+  if (!isoText) return "";
+  const hasZone = /[zZ]|[+-]\d\d:\d\d$/.test(isoText);
+  return dateFormatter.format(new Date(hasZone ? isoText : `${isoText}Z`));
+}
+
+/** "Wireless Headphones" -> "WH": the product tile shows initials (the API has no images). */
+export function initials(text) {
+  return text
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((word) => word[0].toUpperCase())
+    .join("");
+}
+
+
+src/components/products/ProductCard.jsx
+/**
+ * ProductCard: one product in the listing grid - name, category, price and Add to Cart.
+ *
+ * Validation from the case study:
+ * - Add to Cart is enabled only if the product is in stock (stock > 0); otherwise the card
+ *   shows "Out of Stock".
+ * - No field is left blank: missing values show a fallback text.
+ * The parent page decides what "add" does (call the cart API, or send a guest to login).
+ */
+import { useState } from "react";
+import PropTypes from "prop-types";
+import { Link } from "react-router-dom";
+import { formatPrice, initials } from "../../utils/format";
+import { errorText } from "../common/Alert";
+
+export default function ProductCard({ product, categoryName, onAddToCart }) {
+  const [adding, setAdding] = useState(false);
+  const [message, setMessage] = useState({ type: "", text: "" });
+  const inStock = product.stock > 0;
+
+  async function handleAdd() {
+    setAdding(true);
+    setMessage({ type: "", text: "" });
+    try {
+      const added = await onAddToCart(product);
+      if (added) setMessage({ type: "success", text: "Added to cart" });
+    } catch (error) {
+      setMessage({ type: "error", text: errorText(error) });
+    } finally {
+      setAdding(false);
+    }
+  }
+
+  return (
+    <article className="product-card">
+      <Link to={`/products/${product.id}`} className="product-thumb" aria-label={`View ${product.name}`}>
+        {initials(product.name)}
+      </Link>
+      <div className="product-body">
+        <span className="product-category">{categoryName || "Uncategorised"}</span>
+        <h3 className="product-name">
+          <Link to={`/products/${product.id}`}>{product.name}</Link>
+        </h3>
+        <p className="product-description">{product.description || "No description available."}</p>
+        <p className="product-price">{formatPrice(product.price)}</p>
+
+        {inStock ? (
+          <button type="button" className="btn btn-primary btn-block" onClick={handleAdd} disabled={adding}>
+            {adding ? "Adding..." : "Add to Cart"}
+          </button>
+        ) : (
+          <button type="button" className="btn btn-disabled btn-block" disabled>
+            Out of Stock
+          </button>
+        )}
+        {message.text && <p className={`card-message card-message-${message.type}`}>{message.text}</p>}
+      </div>
+    </article>
+  );
+}
+
+export const productShape = PropTypes.shape({
+  id: PropTypes.number.isRequired,
+  sku: PropTypes.string.isRequired,
+  name: PropTypes.string.isRequired,
+  description: PropTypes.string,
+  price: PropTypes.number.isRequired,
+  stock: PropTypes.number.isRequired,
+  category_id: PropTypes.number.isRequired,
+});
+
+ProductCard.propTypes = {
+  product: productShape.isRequired,
+  categoryName: PropTypes.string,
+  onAddToCart: PropTypes.func.isRequired,
+};
+
+
+src/components/products/SearchBar.jsx
+/**
+ * SearchBar: optional text input that filters products by name or category as the user types.
+ * The page debounces the value before calling the API.
+ */
+import PropTypes from "prop-types";
+import Icon from "../common/Icon";
+
+export default function SearchBar({ value, onChange }) {
+  return (
+    <div className="search-bar">
+      <Icon name="search" />
+      <input
+        type="search"
+        placeholder="Search products by name or category..."
+        value={value}
+        maxLength={100}
+        onChange={(event) => onChange(event.target.value)}
+        aria-label="Search products"
+      />
+    </div>
+  );
+}
+
+SearchBar.propTypes = {
+  value: PropTypes.string.isRequired,
+  onChange: PropTypes.func.isRequired,
+};
+
+
+src/components/products/CategoryFilter.jsx
+/** CategoryFilter: dropdown to show one category only ("" = all categories). */
+import PropTypes from "prop-types";
+
+export default function CategoryFilter({ categories, value, onChange }) {
+  return (
+    <select
+      className="select"
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+      aria-label="Filter by category"
+    >
+      <option value="">All categories</option>
+      {categories.map((category) => (
+        <option key={category.id} value={category.id}>
+          {category.name}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+CategoryFilter.propTypes = {
+  categories: PropTypes.arrayOf(PropTypes.shape({ id: PropTypes.number.isRequired, name: PropTypes.string.isRequired }))
+    .isRequired,
+  value: PropTypes.string.isRequired,
+  onChange: PropTypes.func.isRequired,
+};
+
+
+src/pages/ProductListPage.jsx
+/**
+ * Product listing page (the landing page): a search bar on top, then a grid of product cards.
+ *
+ * - The search is optional and filters by name or category as the user types. The text is
+ *   debounced (300 ms) and sent to GET /api/products/search; empty text uses GET /api/products.
+ * - The category dropdown narrows the list to one category.
+ * - Every answer is stored with the search it belongs to (`key`). "Loading" simply means
+ *   "the stored answer is not for the current search yet", and answers to old searches are
+ *   ignored, so a slow early response can't overwrite what the user typed last.
+ */
+import { useEffect, useMemo, useState } from "react";
+import { fetchCategories, fetchProducts, searchProducts } from "../api/productApi";
+import Alert, { errorText } from "../components/common/Alert";
+import Loader from "../components/common/Loader";
+import CategoryFilter from "../components/products/CategoryFilter";
+import ProductCard from "../components/products/ProductCard";
+import SearchBar from "../components/products/SearchBar";
+import { useAddToCart } from "../hooks/useAddToCart";
+import { useDebouncedValue } from "../hooks/useDebouncedValue";
+
+export default function ProductListPage() {
+  const [searchText, setSearchText] = useState("");
+  const [categoryId, setCategoryId] = useState("");
+  const [categories, setCategories] = useState([]);
+  const [categoryError, setCategoryError] = useState("");
+  const [result, setResult] = useState({ key: null, products: [], error: "" });
+  const debouncedText = useDebouncedValue(searchText.trim(), 300);
+  const addToCart = useAddToCart();
+
+  const searchKey = `${debouncedText}|${categoryId}`;
+  const loading = result.key !== searchKey;
+
+  // Categories: once, for the dropdown and the names on the cards.
+  useEffect(() => {
+    fetchCategories()
+      .then(setCategories)
+      .catch((err) => setCategoryError(errorText(err)));
+  }, []);
+
+  // Products: again whenever the (debounced) search text or the category changes.
+  useEffect(() => {
+    let ignore = false;
+    const request = debouncedText
+      ? searchProducts({ text: debouncedText, categoryId })
+      : fetchProducts({ categoryId });
+    request
+      .then((products) => !ignore && setResult({ key: searchKey, products, error: "" }))
+      .catch((err) => !ignore && setResult({ key: searchKey, products: [], error: errorText(err) }));
+    return () => {
+      ignore = true;
+    };
+  }, [debouncedText, categoryId, searchKey]);
+
+  const categoryNames = useMemo(
+    () => Object.fromEntries(categories.map((category) => [category.id, category.name])),
+    [categories],
+  );
+
+  return (
+    <section className="page">
+      <div className="toolbar">
+        <SearchBar value={searchText} onChange={setSearchText} />
+        <CategoryFilter categories={categories} value={categoryId} onChange={setCategoryId} />
+      </div>
+
+      <Alert>{result.error || categoryError}</Alert>
+      {loading && <Loader text="Loading products..." />}
+      {!loading && !result.error && result.products.length === 0 && <p className="empty-state">No products found.</p>}
+
+      {!loading && (
+        <div className="product-grid">
+          {result.products.map((product) => (
+            <ProductCard
+              key={product.id}
+              product={product}
+              categoryName={categoryNames[product.category_id]}
+              onAddToCart={addToCart}
+            />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+
+src/pages/ProductDetailsPage.jsx
+/**
+ * Product details page: everything about one product, with a quantity box and Add to Cart.
+ * GET /api/products/{id}: 404 (unknown or inactive product) shows "Product not found".
+ */
+import { useEffect, useState } from "react";
+import { Link, useParams } from "react-router-dom";
+import { fetchCategories, fetchProduct } from "../api/productApi";
+import Alert, { errorText } from "../components/common/Alert";
+import Loader from "../components/common/Loader";
+import { useAddToCart } from "../hooks/useAddToCart";
+import { formatPrice, initials } from "../utils/format";
+import { validateQuantity } from "../utils/validators";
+
+export default function ProductDetailsPage() {
+  const { productId } = useParams();
+  // The loaded product, remembered with the id it belongs to ("loading" = not loaded for this id yet).
+  const [result, setResult] = useState({ id: null, product: null, categoryName: "", error: "" });
+  const [quantity, setQuantity] = useState("1");
+  const [adding, setAdding] = useState(false);
+  const [message, setMessage] = useState({ type: "", text: "" });
+  const addToCart = useAddToCart();
+
+  useEffect(() => {
+    let ignore = false;
+    Promise.all([fetchProduct(productId), fetchCategories()])
+      .then(([product, categories]) => {
+        if (ignore) return;
+        const categoryName = categories.find((category) => category.id === product.category_id)?.name ?? "";
+        setResult({ id: productId, product, categoryName, error: "" });
+      })
+      .catch((err) => {
+        if (ignore) return;
+        const error = err.status === 404 ? "Product not found." : errorText(err);
+        setResult({ id: productId, product: null, categoryName: "", error });
+      });
+    return () => {
+      ignore = true;
+    };
+  }, [productId]);
+
+  const { product, categoryName, error } = result;
+  const loading = result.id !== productId;
+
+  if (loading) return <Loader text="Loading product..." />;
+  if (error || !product) {
+    return (
+      <section className="page narrow">
+        <Alert>{error || "Product not found."}</Alert>
+        <Link to="/">Back to products</Link>
+      </section>
+    );
+  }
+
+  const inStock = product.stock > 0;
+  const quantityError = inStock ? validateQuantity(quantity, product.stock) : "";
+
+  async function handleAdd() {
+    setAdding(true);
+    setMessage({ type: "", text: "" });
+    try {
+      if (await addToCart(product, Number(quantity))) setMessage({ type: "success", text: "Added to cart" });
+    } catch (err) {
+      setMessage({ type: "error", text: errorText(err) });
+    } finally {
+      setAdding(false);
+    }
+  }
+
+  return (
+    <section className="page">
+      <Link to="/" className="back-link">
+        ← Back to products
+      </Link>
+      <div className="details">
+        <div className="details-thumb">{initials(product.name)}</div>
+        <div>
+          <span className="product-category">{categoryName || "Uncategorised"}</span>
+          <h1>{product.name}</h1>
+          <p className="product-price large">{formatPrice(product.price)}</p>
+          <p>{product.description || "No description available."}</p>
+          <dl className="details-list">
+            <dt>SKU</dt>
+            <dd>{product.sku}</dd>
+            <dt>Availability</dt>
+            <dd>{inStock ? `${product.stock} in stock` : "Out of Stock"}</dd>
+          </dl>
+
+          {inStock ? (
+            <div className="details-actions">
+              <input
+                type="number"
+                min="1"
+                max={product.stock}
+                className={quantityError ? "input qty-input input-invalid" : "input qty-input"}
+                value={quantity}
+                onChange={(event) => setQuantity(event.target.value)}
+                aria-label="Quantity"
+              />
+              <button type="button" className="btn btn-primary" onClick={handleAdd} disabled={Boolean(quantityError) || adding}>
+                {adding ? "Adding..." : "Add to Cart"}
+              </button>
+            </div>
+          ) : (
+            <button type="button" className="btn btn-disabled" disabled>
+              Out of Stock
+            </button>
+          )}
+          {quantityError && <p className="field-error">{quantityError}</p>}
+          {message.text && <p className={`card-message card-message-${message.type}`}>{message.text}</p>}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+
+src/App.jsx 
+/**
+ * App: the routes. Every page renders inside <Layout> (Header + Main Content + Footer).
+ *
+ *   /                 product listing + search    (public)   <- Milestone 2
+ *   /products/:id     product details             (public)   <- Milestone 2
+ *   /register, /login                             (public)   <- Milestone 1
+ */
+import { Route, Routes } from "react-router-dom";
+import Layout from "./components/layout/Layout";
+import LoginPage from "./pages/LoginPage";
+import NotFoundPage from "./pages/NotFoundPage";
+import ProductDetailsPage from "./pages/ProductDetailsPage";
+import ProductListPage from "./pages/ProductListPage";
+import RegisterPage from "./pages/RegisterPage";
+
+export default function App() {
+  return (
+    <Routes>
+      <Route element={<Layout />}>
+        <Route index element={<ProductListPage />} />
+        <Route path="products/:productId" element={<ProductDetailsPage />} />
+        <Route path="register" element={<RegisterPage />} />
+        <Route path="login" element={<LoginPage />} />
+        <Route path="*" element={<NotFoundPage />} />
+      </Route>
+    </Routes>
+  );
+}
