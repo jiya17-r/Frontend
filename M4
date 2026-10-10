@@ -1,0 +1,391 @@
+src/api/orderApi.js (new)
+/**
+ * Order endpoints (backend: app/routes/orders.py). Customer token required.
+ * Milestone 5 adds placeOrder (checkout) and retryPayment here.
+ */
+import { apiRequest } from "./client";
+
+/** GET /api/orders/me - only the logged-in user's orders, newest first. */
+export function fetchMyOrders() {
+  return apiRequest("/api/orders/me");
+}
+
+/** GET /api/orders/{id} - 403 if the order belongs to someone else, 404 if it doesn't exist. */
+export function fetchOrder(orderId) {
+  return apiRequest(`/api/orders/${orderId}`);
+}
+
+
+src/components/common/StatusBadge.jsx (new)
+/** StatusBadge: order / payment status as a coloured pill ("Confirmed", "Payment Failed", ...). */
+import PropTypes from "prop-types";
+
+const TONES = {
+  Confirmed: "success",
+  Paid: "success",
+  "Pending Payment": "warning",
+  Pending: "warning",
+  "Payment Failed": "danger",
+  Failed: "danger",
+  Cancelled: "neutral",
+};
+
+export default function StatusBadge({ status }) {
+  return <span className={`badge badge-${TONES[status] ?? "neutral"}`}>{status}</span>;
+}
+
+StatusBadge.propTypes = {
+  status: PropTypes.string.isRequired,
+};
+
+
+src/components/orders/OrderItemsTable.jsx (new)
+/** OrderItemsTable: every product of an order with quantity, price and subtotal. */
+import PropTypes from "prop-types";
+import { formatPrice } from "../../utils/format";
+
+export default function OrderItemsTable({ items, total }) {
+  return (
+    <div className="table-wrap">
+      <table className="table">
+        <thead>
+          <tr>
+            <th>Product</th>
+            <th>Qty</th>
+            <th>Price</th>
+            <th>Subtotal</th>
+          </tr>
+        </thead>
+        <tbody>
+          {items.map((item, index) => (
+            <tr key={`${item.product_id}-${index}`}>
+              <td>{item.product_name}</td>
+              <td>{item.quantity}</td>
+              <td>{formatPrice(item.unit_price)}</td>
+              <td>{formatPrice(item.line_total)}</td>
+            </tr>
+          ))}
+        </tbody>
+        <tfoot>
+          <tr>
+            <td colSpan={3} className="text-right">
+              Total
+            </td>
+            <td>
+              <strong>{formatPrice(total)}</strong>
+            </td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  );
+}
+
+export const orderItemShape = PropTypes.shape({
+  product_id: PropTypes.number,
+  product_name: PropTypes.string.isRequired,
+  unit_price: PropTypes.number.isRequired,
+  quantity: PropTypes.number.isRequired,
+  line_total: PropTypes.number.isRequired,
+});
+
+OrderItemsTable.propTypes = {
+  items: PropTypes.arrayOf(orderItemShape).isRequired,
+  total: PropTypes.number.isRequired,
+};
+
+
+src/components/orders/OrderListItem.jsx (new)
+/** OrderListItem: one row of the order history - number, date, total, status, View Details. */
+import PropTypes from "prop-types";
+import { Link } from "react-router-dom";
+import { formatDate, formatPrice } from "../../utils/format";
+import StatusBadge from "../common/StatusBadge";
+
+export default function OrderListItem({ order }) {
+  const itemCount = order.items.reduce((sum, item) => sum + item.quantity, 0);
+  return (
+    <article className="order-row">
+      <div>
+        <p className="order-number">Order {order.order_number}</p>
+        <p className="muted">
+          {formatDate(order.created_at)} · {itemCount} item(s)
+        </p>
+      </div>
+      <StatusBadge status={order.status} />
+      <p className="order-total">{formatPrice(order.total_amount)}</p>
+      <Link to={`/orders/${order.id}`} className="btn btn-outline btn-small">
+        View Details
+      </Link>
+    </article>
+  );
+}
+
+OrderListItem.propTypes = {
+  order: PropTypes.shape({
+    id: PropTypes.number.isRequired,
+    order_number: PropTypes.string.isRequired,
+    status: PropTypes.string.isRequired,
+    total_amount: PropTypes.number.isRequired,
+    created_at: PropTypes.string.isRequired,
+    items: PropTypes.arrayOf(PropTypes.shape({ quantity: PropTypes.number.isRequired })).isRequired,
+  }).isRequired,
+};
+
+
+src/pages/OrderHistoryPage.jsx (new)
+/**
+ * Order history page: the logged-in user's past orders (GET /api/orders/me returns ONLY
+ * their own orders - the backend filters by the token's user).
+ * No orders -> "No orders found."
+ */
+import { useEffect, useState } from "react";
+import { fetchMyOrders } from "../api/orderApi";
+import Alert, { errorText } from "../components/common/Alert";
+import Loader from "../components/common/Loader";
+import OrderListItem from "../components/orders/OrderListItem";
+
+export default function OrderHistoryPage() {
+  const [orders, setOrders] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    fetchMyOrders()
+      .then(setOrders)
+      .catch((err) => setError(errorText(err)))
+      .finally(() => setLoading(false));
+  }, []);
+
+  if (loading) return <Loader text="Loading your orders..." />;
+
+  return (
+    <section className="page">
+      <h1>Order History</h1>
+      <Alert>{error}</Alert>
+      {!error && orders.length === 0 && <p className="empty-state">No orders found.</p>}
+      <div className="order-list">
+        {orders.map((order) => (
+          <OrderListItem key={order.id} order={order} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+
+src/pages/OrderDetailsPage.jsx 
+/**
+ * Order details page: every product, quantity and price of one order, plus its status.
+ *
+ * - GET /api/orders/{id}: the backend answers 403 if the order belongs to someone else
+ *   and 404 if it doesn't exist; both get a clear message.
+ * - A "Payment Failed" order shows why. (Milestone 5 adds Retry Payment and
+ *   "Move items back to cart" here.)
+ */
+import { useEffect, useState } from "react";
+import { Link, useParams } from "react-router-dom";
+import { fetchOrder } from "../api/orderApi";
+import Alert, { errorText } from "../components/common/Alert";
+import Loader from "../components/common/Loader";
+import StatusBadge from "../components/common/StatusBadge";
+import OrderItemsTable from "../components/orders/OrderItemsTable";
+import { formatDate } from "../utils/format";
+
+export default function OrderDetailsPage() {
+  const { orderId } = useParams();
+  // The loaded order, remembered with the id it belongs to ("loading" = not loaded for this id yet).
+  const [result, setResult] = useState({ id: null, order: null, error: "" });
+
+  useEffect(() => {
+    let ignore = false;
+    fetchOrder(orderId)
+      .then((order) => !ignore && setResult({ id: orderId, order, error: "" }))
+      .catch((err) => {
+        if (ignore) return;
+        let error = errorText(err);
+        if (err.status === 403) error = "You can only view your own orders.";
+        if (err.status === 404) error = "Order not found.";
+        setResult({ id: orderId, order: null, error });
+      });
+    return () => {
+      ignore = true;
+    };
+  }, [orderId]);
+
+  const { order, error } = result;
+  if (result.id !== orderId) return <Loader text="Loading order..." />;
+  if (error || !order) {
+    return (
+      <section className="page narrow">
+        <Alert>{error || "Order not found."}</Alert>
+        <Link to="/orders">Back to order history</Link>
+      </section>
+    );
+  }
+
+  return (
+    <section className="page">
+      <Link to="/orders" className="back-link">
+        ← Back to order history
+      </Link>
+      <h1>Order {order.order_number}</h1>
+
+      {order.status === "Payment Failed" && (
+        <Alert type="error">Payment failed: {order.failure_reason ?? "the payment could not be completed"}.</Alert>
+      )}
+
+      <dl className="order-meta">
+        <dt>Date</dt>
+        <dd>{formatDate(order.created_at)}</dd>
+        <dt>Status</dt>
+        <dd>
+          <StatusBadge status={order.status} />
+        </dd>
+        <dt>Payment</dt>
+        <dd>
+          {order.payment_method && `${order.payment_method} · `}
+          <StatusBadge status={order.payment_status} />
+        </dd>
+        {order.payment_reference && (
+          <>
+            <dt>Reference</dt>
+            <dd>{order.payment_reference}</dd>
+          </>
+        )}
+      </dl>
+
+      <OrderItemsTable items={order.items} total={order.total_amount} />
+    </section>
+  );
+}
+
+
+src/App.jsx (replace)
+/**
+ * App: the routes. Every page renders inside <Layout> (Header + Main Content + Footer).
+ *
+ *   /                      home page                    (public)          <- Milestone 1
+ *   /register, /login                                   (public)          <- Milestone 1
+ *   /products              product listing + search     (public)          <- Milestone 2
+ *   /products/:productId   product details              (public)          <- Milestone 2
+ *   /cart                  the customer's cart          (customers only)  <- Milestone 3
+ *   /orders                my order history             (customers only)  <- Milestone 4
+ *   /orders/:orderId       one order's details          (customers only)  <- Milestone 4
+ *   /checkout              placeholder until Milestone 5 (customers only)
+ */
+import { Link, Route, Routes } from "react-router-dom";
+import ProtectedRoute from "./components/common/ProtectedRoute";
+import Layout from "./components/layout/Layout";
+import CartPage from "./pages/CartPage";
+import HomePage from "./pages/HomePage";
+import LoginPage from "./pages/LoginPage";
+import NotFoundPage from "./pages/NotFoundPage";
+import OrderDetailsPage from "./pages/OrderDetailsPage";
+import OrderHistoryPage from "./pages/OrderHistoryPage";
+import ProductDetailsPage from "./pages/ProductDetailsPage";
+import ProductListPage from "./pages/ProductListPage";
+import RegisterPage from "./pages/RegisterPage";
+
+const CUSTOMER_ONLY = ["customer"];
+
+/** Wrap a page so only logged-in customers can open it. */
+function customerPage(page) {
+  return <ProtectedRoute roles={CUSTOMER_ONLY}>{page}</ProtectedRoute>;
+}
+
+/** Where the cart's Checkout button leads until the real checkout page (Milestone 5). */
+function CheckoutPlaceholder() {
+  return (
+    <section className="page narrow">
+      <h1>Checkout</h1>
+      <p className="muted">Order placement arrives in Milestone 5.</p>
+      <Link to="/cart">Back to cart</Link>
+    </section>
+  );
+}
+
+export default function App() {
+  return (
+    <Routes>
+      <Route element={<Layout />}>
+        <Route index element={<HomePage />} />
+        <Route path="register" element={<RegisterPage />} />
+        <Route path="login" element={<LoginPage />} />
+        <Route path="products" element={<ProductListPage />} />
+        <Route path="products/:productId" element={<ProductDetailsPage />} />
+        <Route path="cart" element={customerPage(<CartPage />)} />
+        <Route path="orders" element={customerPage(<OrderHistoryPage />)} />
+        <Route path="orders/:orderId" element={customerPage(<OrderDetailsPage />)} />
+        <Route path="checkout" element={customerPage(<CheckoutPlaceholder />)} />
+        <Route path="*" element={<NotFoundPage />} />
+      </Route>
+    </Routes>
+  );
+}
+
+
+src/components/layout/Menu.jsx (replace)
+/**
+ * Menu: links to the different sections of the app. NavLink highlights the current page.
+ * Milestone 1: Home, and Login/Register for logged-out users.
+ * Milestone 2: Products (also highlighted on a product's details page).
+ * Milestone 3: Cart, for logged-in customers.
+ * Milestone 4: Orders, for logged-in customers.
+ */
+import { NavLink } from "react-router-dom";
+import { useAuth } from "../../context/AuthContext";
+
+const linkClass = ({ isActive }) => (isActive ? "menu-link active" : "menu-link");
+
+export default function Menu() {
+  const { isLoggedIn, isCustomer } = useAuth();
+
+  return (
+    <nav className="menu" aria-label="Main navigation">
+      <NavLink to="/" end className={linkClass}>
+        Home
+      </NavLink>
+      <NavLink to="/products" className={linkClass}>
+        Products
+      </NavLink>
+      {isCustomer && (
+        <>
+          <NavLink to="/cart" className={linkClass}>
+            Cart
+          </NavLink>
+          <NavLink to="/orders" className={linkClass}>
+            Orders
+          </NavLink>
+        </>
+      )}
+      {!isLoggedIn && (
+        <>
+          <NavLink to="/login" className={linkClass}>
+            Login
+          </NavLink>
+          <NavLink to="/register" className={linkClass}>
+            Register
+          </NavLink>
+        </>
+      )}
+    </nav>
+  );
+}
+
+
+src/components/layout/Header.jsx (small change)
+                    <p className="profile-email">{user.email}</p>
+                    {isCustomer && (
+                      <Link to="/orders" onClick={() => setProfileOpen(false)}>
+                        My Orders
+                      </Link>
+                    )}
+
+
+src/components/layout/Footer.jsx (one line)
+          <Link to="/cart">Cart</Link>
+          <Link to="/orders">My Orders</Link>
+
+
+
