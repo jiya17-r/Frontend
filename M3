@@ -618,3 +618,32 @@ src/components/layout/Footer.jsx (one line)
           <Link to="/cart">Cart</Link>
           <Link to="/register">Register</Link>
           <Link to="/login">Login</Link>
+
+
+/**
+ * Home page (landing page): a welcome message and a button to start shopping.
+ * Shows the user's name once they are logged in.
+ */
+import { Link } from "react-router-dom";
+import { useAuth } from "../context/AuthContext";
+
+export default function HomePage() {
+  const { user } = useAuth();
+  return (
+    <section className="page narrow">
+      <h1>{user ? `Welcome, ${user.full_name}!` : "Welcome to ABC Shop"}</h1>
+      <p className="muted">Your one-stop shop for the latest products and unbeatable deals.</p>
+      <div className="form-actions">
+        <Link to="/products" className="btn btn-primary">
+          Browse Products
+        </Link>
+        {!user && (
+          <Link to="/register" className="btn btn-outline">
+            Create an account
+          </Link>
+        )}
+      </div>
+    </section>
+  );
+}
+
