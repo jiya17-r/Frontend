@@ -1,0 +1,334 @@
+app/core/exceptions.py
+Replace AppError.__init__:
+    def __init__(self, message: str, **extra: object):
+        super().__init__(message)
+        self.message = message
+        self.extra = extra  # optional fields added to the error body, e.g. order_id
+
+Add this class above ServiceUnavailableError:
+class PaymentFailedError(AppError):
+    """Payment declined or gateway down. The order is saved as "Payment Failed" and can be retried."""
+
+    status_code = status.HTTP_402_PAYMENT_REQUIRED
+
+Replace error_response
+def error_response(
+    status_code: int, detail: object, headers: dict[str, str] | None = None, extra: dict | None = None
+) -> JSONResponse:
+    """The one error format of the API: {"detail": ..., <extra fields>, "request_id": ...}."""
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": detail, **(extra or {}), "request_id": request_id_var.get()},
+        headers=headers,
+    )
+
+In register_exception_handlers, the AppError handler's return line becomes:
+        return error_response(exc.status_code, exc.message, exc.headers, exc.extra)
+
+
+app/core/__init__.py
+
+Add PaymentFailedError, to the from app.core.exceptions import (...) list, and "PaymentFailedError", to __all__.
+
+app/services/order_service.py
+
+Add PaymentFailedError to the core import:
+from app.core import BusinessRuleError, ConflictError, NotFoundError, PaymentFailedError, settings
+
+
+Replace the whole _charge method:
+    async def _charge(self, order: Order) -> Order:
+        """
+        Call the gateway and record the outcome.
+
+        Approved -> "Confirmed" / "Paid" (returned).
+        Declined or gateway down -> "Payment Failed" / "Failed" is SAVED first, the stock is
+        released, and then PaymentFailedError (402) is raised with the order id, so the client
+        knows the order was not placed and which order to retry.
+        """
+        try:
+            reference = await self.gateway.charge(order.order_number, order.total_amount, settings.currency)
+        except PaymentDeclinedError as exc:
+            reason = f"Payment declined: {exc}"
+        except PaymentGatewayError as exc:
+            reason = f"Payment service unavailable: {exc}"
+        else:
+            order.status = OrderStatus.CONFIRMED
+            order.payment_status = PaymentStatus.PAID
+            order.payment_reference = reference
+            logger.info("Order %s paid (%s)", order.order_number, reference, extra={"context": {"order_id": order.id}})
+            return await self.repository.save(order)
+
+        # FALLBACK: keep the order (never Confirmed), give the stock back, let the customer retry.
+        await self._release_stock(order)
+        order.status = OrderStatus.PAYMENT_FAILED
+        order.payment_status = PaymentStatus.FAILED
+        order.failure_reason = reason[:255]
+        await self.repository.save(order)  # the failed state is stored BEFORE we answer
+        logger.warning("Order %s: %s", order.order_number, reason, extra={"context": {"order_id": order.id}})
+        raise PaymentFailedError(
+            f"{reason}. Retry with POST /api/payments/process",
+            order_id=order.id,
+            order_number=order.order_number,
+        )
+
+app/models/order.py
+Add a status to OrderStatus:
+class OrderStatus(enum.Enum):
+    PENDING_PAYMENT = "Pending Payment"
+    CONFIRMED = "Confirmed"
+    PAYMENT_FAILED = "Payment Failed"
+    CANCELLED = "Cancelled"  # a failed order the customer gave up on (items went back to the cart)
+
+
+app/repositories/cart_repository.py
+Add this method above delete:
+
+    def stage(self, item: CartItem) -> None:
+        """Add a line WITHOUT committing: a multi-table flow commits everything together."""
+        self.db.add(item)
+
+
+app/services/order_service.py
+
+Add CartItem to the models import:
+
+from app.models import CartItem, Order, OrderItem, OrderStatus, PaymentStatus, Product
+
+
+Add this method above list_my_orders:
+    async def return_to_cart(self, order: Order) -> Order:
+        """
+        The customer gave up on a "Payment Failed" order and wants to change it: put its items
+        back into their cart and cancel the order. They can then add or remove items and check
+        out again, which creates a NEW order. Ownership was checked by the route.
+
+        - Only "Payment Failed" orders: a paid order can't be undone this way (409).
+        - Stock needs no change: it was already released when the payment failed.
+        - An item already in the cart is merged (quantities added up, capped at the per-product limit).
+        - Cart lines + cancelled order are saved in ONE commit: all or nothing.
+        """
+        if order.status != OrderStatus.PAYMENT_FAILED:
+            raise ConflictError(
+                f"Order {order.order_number} is '{order.status.value}'; only orders whose payment failed "
+                "can be moved back to the cart"
+            )
+        for item in order.items:
+            if item.product_id is None:  # the product was deleted meanwhile
+                continue
+            line = await self.cart.get_line(order.user_id, item.product_id)
+            if line is not None:
+                line.quantity = min(line.quantity + item.quantity, settings.max_quantity_per_item)
+            else:
+                self.cart.stage(CartItem(user_id=order.user_id, product_id=item.product_id, quantity=item.quantity))
+        order.status = OrderStatus.CANCELLED
+        order.failure_reason = "Cancelled by the customer; items moved back to the cart"
+        logger.info(
+            "Order %s cancelled, items back in the cart", order.order_number, extra={"context": {"order_id": order.id}}
+        )
+        return await self.repository.save(order)
+
+
+app/routes/orders.py
+@router.post("/{order_id}/return-to-cart", response_model=OrderOut)
+async def return_order_to_cart(order_id: int, current_user: CurrentUser, service: OrderServiceDep, audit: AuditDep):
+    """
+    Cancel a "Payment Failed" order and put its items back into the cart, so the customer can
+    change the cart (add or remove items) and check out again.
+
+    403 someone else's order, 404 unknown order, 409 the order isn't "Payment Failed".
+    """
+    order = await service.get_order(order_id)
+    # ABAC: only the customer who placed the order.
+    check_permission(current_user, "orders", "return_to_cart", owner_id=order.user_id)
+    order = await service.return_to_cart(order)
+    audit.record(current_user.id, "return_to_cart", "orders", order.id, order.order_number)
+    return order
+
+app/policy/policy.csv
+p, customer, orders, return_to_cart, r.user_id == r.owner_id
+
+
+tests/fakes.py
+    def stage(self, item: CartItem) -> None:
+        item.id = self.next_id
+        self.next_id += 1
+        self.rows[item.id] = item
+
+
+tests/test_api_cart_orders.py
+
+Replace test_gateway_down_keeps_order_and_stock_consistent and test_declined_payment with:
+
+async def test_failed_payment_is_402_and_order_is_never_confirmed(
+    client, customer, product, login_as, payment_gateway, notifier
+):
+    login_as(customer)
+    payment_gateway.mode = "down"
+    await add(client, product.id, 2)
+
+    response = await client.post("/api/orders/checkout")
+
+    assert response.status_code == 402  # not a 201 that looks like success
+    body = response.json()
+    assert "unavailable" in body["detail"]
+    assert body["order_number"].startswith("ORD-")
+    order = (await client.get(f"/api/orders/{body['order_id']}")).json()
+    assert (order["status"], order["payment_status"]) == ("Payment Failed", "Failed")
+    assert await stock_of(client, product.id) == 10  # stock released
+    assert notifier.sent == []  # no confirmation for an unpaid order
+
+
+async def test_declined_payment_is_402(client, customer, product, login_as, payment_gateway):
+    login_as(customer)
+    payment_gateway.mode = "decline"
+    await add(client, product.id)
+
+    response = await client.post("/api/orders/checkout")
+
+    assert response.status_code == 402
+    assert "declined" in response.json()["detail"]
+
+
+In test_a_failed_payment_can_be_retried and test_cannot_pay_someone_elses_order, the id now comes from the 402 body. Change .json()["id"] to .json()["order_id"] on the checkout line.
+
+Add these tests at the end of the file:
+
+async def test_a_retry_that_fails_again_is_402(client, customer, product, login_as, payment_gateway):
+    login_as(customer)
+    payment_gateway.mode = "down"
+    await add(client, product.id, 2)
+    order_id = (await client.post("/api/orders/checkout")).json()["order_id"]
+
+    response = await client.post("/api/payments/process", json={"order_id": order_id})
+
+    assert response.status_code == 402
+    assert response.json()["order_id"] == order_id
+    assert await stock_of(client, product.id) == 10  # released again
+
+
+# ---- Changing a failed order: move its items back to the cart -------------------------------
+
+
+async def test_failed_order_items_go_back_to_the_cart(
+    client, db, customer, category, product, login_as, payment_gateway
+):
+    login_as(customer)
+    payment_gateway.mode = "down"
+    await add(client, product.id, 2)
+    order_id = (await client.post("/api/orders/checkout")).json()["order_id"]
+
+    response = await client.post(f"/api/orders/{order_id}/return-to-cart")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "Cancelled"
+    cart = (await client.get("/api/cart")).json()
+    assert [(line["product_id"], line["quantity"]) for line in cart["items"]] == [(product.id, 2)]
+    assert await stock_of(client, product.id) == 10  # nothing reserved by the cancelled order
+
+    # ... the customer changes their mind, adds one more product, and checks out again
+    extra = await create_product(db, category.id, sku="ELEC-002", name="Charger", price="100.00")
+    await add(client, extra.id, 1)
+    payment_gateway.mode = "approve"
+    new_order = (await client.post("/api/orders/checkout")).json()
+
+    assert new_order["id"] != order_id  # a NEW order
+    assert new_order["status"] == "Confirmed"
+    assert new_order["total_amount"] == 1098.0  # 2 x 499 + 100
+    retry = await client.post("/api/payments/process", json={"order_id": order_id})
+    assert retry.status_code == 409  # the cancelled order can't be paid any more
+
+
+async def test_returned_items_merge_with_the_cart(client, customer, product, login_as, payment_gateway):
+    login_as(customer)
+    payment_gateway.mode = "down"
+    await add(client, product.id, 2)
+    order_id = (await client.post("/api/orders/checkout")).json()["order_id"]
+    await add(client, product.id, 1)  # same product added again meanwhile
+
+    await client.post(f"/api/orders/{order_id}/return-to-cart")
+
+    items = (await client.get("/api/cart")).json()["items"]
+    assert [line["quantity"] for line in items] == [3]  # one line, quantities added up
+
+
+async def test_a_confirmed_order_cannot_go_back_to_the_cart(client, customer, product, login_as):
+    login_as(customer)
+    await add(client, product.id)
+    order_id = (await client.post("/api/orders/checkout")).json()["id"]
+
+    response = await client.post(f"/api/orders/{order_id}/return-to-cart")
+
+    assert response.status_code == 409
+
+
+async def test_cannot_return_someone_elses_order(client, customer, other_customer, product, login_as, payment_gateway):
+    login_as(customer)
+    payment_gateway.mode = "down"
+    await add(client, product.id)
+    order_id = (await client.post("/api/orders/checkout")).json()["order_id"]
+    login_as(other_customer)
+
+    response = await client.post(f"/api/orders/{order_id}/return-to-cart")
+
+    assert response.status_code == 403
+
+
+
+tests/test_order_service.py
+from app.core import BusinessRuleError, ConflictError, NotFoundError, PaymentFailedError
+
+
+Replace test_gateway_down_fails_the_payment_and_releases_stock and test_declined_payment_is_recorded with:
+
+async def failed_checkout(shop) -> tuple[object, PaymentFailedError]:
+    """Check out while the gateway fails; return the saved order and the raised error."""
+    with pytest.raises(PaymentFailedError) as error:
+        await shop.service.checkout(USER_ID)
+    return shop.orders.rows[error.value.extra["order_id"]], error.value
+
+
+async def test_gateway_down_raises_402_and_saves_a_failed_order(shop):
+    shop.gateway.mode = "down"
+
+    order, error = await failed_checkout(shop)
+
+    assert error.status_code == 402
+    assert error.extra["order_number"] == order.order_number
+    assert (order.status, order.payment_status) == (OrderStatus.PAYMENT_FAILED, PaymentStatus.FAILED)
+    assert order.failure_reason.startswith("Payment service unavailable")
+    assert shop.product.stock == 5  # released
+
+
+async def test_declined_payment_is_recorded(shop):
+    shop.gateway.mode = "decline"
+
+    order, error = await failed_checkout(shop)
+
+    assert order.status == OrderStatus.PAYMENT_FAILED
+    assert error.message.startswith("Payment declined")
+
+
+In test_retry_after_failure and test_retry_without_stock_is_rejected, replace the line order = await shop.service.checkout(USER_ID) with:
+
+    order, _ = await failed_checkout(shop)
+
+
+async def test_return_to_cart_cancels_and_refills_the_cart(shop):
+    shop.gateway.mode = "down"
+    order, _ = await failed_checkout(shop)
+
+    order = await shop.service.return_to_cart(order)
+
+    assert order.status == OrderStatus.CANCELLED
+    assert [(line.product_id, line.quantity) for line in shop.cart.rows.values()] == [(1, 2)]
+    assert shop.product.stock == 5  # unchanged: released when the payment failed
+
+
+async def test_only_failed_orders_go_back_to_the_cart(shop):
+    order = await shop.service.checkout(USER_ID)  # paid
+
+    with pytest.raises(ConflictError):
+        await shop.service.return_to_cart(order)
+
+
