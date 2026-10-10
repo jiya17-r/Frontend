@@ -1,0 +1,1579 @@
+app/core/exceptions.py (replace)
+"""
+App errors and the handlers that turn them into JSON responses.
+
+Student notes:
+- Services raise these errors; they know nothing about HTTP. The handlers below map each
+  error to its status code, so routes never build error responses by hand.
+- Every error response carries the request_id: {"detail": "...", "request_id": "3f2a9c1b"}.
+  A user reports the id, and we find the matching log lines (traceable errors).
+- An error can carry extra fields for the client, e.g. a failed payment (402) includes the
+  order_id: {"detail": "...", "order_id": 7, "order_number": "ORD-...", "request_id": "..."}.
+- Three kinds are handled: our AppErrors, FastAPI's validation errors (422) and HTTP errors
+  raised by FastAPI itself (e.g. 401 from OAuth2PasswordBearer when the token is missing).
+"""
+
+import logging
+
+from fastapi import FastAPI, Request, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app.core.logging_config import request_id_var
+
+logger = logging.getLogger(__name__)
+
+
+class AppError(Exception):
+    """Base class for all app errors. Subclasses set the HTTP status code."""
+
+    status_code: int = status.HTTP_400_BAD_REQUEST
+    headers: dict[str, str] | None = None
+
+    def __init__(self, message: str, **extra: object):
+        super().__init__(message)
+        self.message = message
+        self.extra = extra  # optional fields added to the error body, e.g. order_id
+
+
+class UnauthorizedError(AppError):
+    """We don't know who the caller is: no token, a bad token, or a wrong password."""
+
+    status_code = status.HTTP_401_UNAUTHORIZED
+    headers = {"WWW-Authenticate": "Bearer"}  # tells the client which scheme to use
+
+
+class ForbiddenError(AppError):
+    """We know who the caller is, but they aren't allowed to do this."""
+
+    status_code = status.HTTP_403_FORBIDDEN
+
+
+class NotFoundError(AppError):
+    """The requested record doesn't exist."""
+
+    status_code = status.HTTP_404_NOT_FOUND
+
+
+class ConflictError(AppError):
+    """The request is valid, but not allowed in the record's current state (or a duplicate)."""
+
+    status_code = status.HTTP_409_CONFLICT
+
+
+class BusinessRuleError(AppError):
+    """The input breaks a business rule (e.g. empty cart, unknown category)."""
+
+    status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+
+
+class PaymentFailedError(AppError):
+    """Payment declined or gateway down. The order is saved as "Payment Failed" and can be retried."""
+
+    status_code = status.HTTP_402_PAYMENT_REQUIRED
+
+
+class ServiceUnavailableError(AppError):
+    """A dependency we need is down (e.g. the database)."""
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
+
+def error_response(
+    status_code: int, detail: object, headers: dict[str, str] | None = None, extra: dict | None = None
+) -> JSONResponse:
+    """The one error format of the API: {"detail": ..., <extra fields>, "request_id": ...}."""
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": detail, **(extra or {}), "request_id": request_id_var.get()},
+        headers=headers,
+    )
+
+
+def register_exception_handlers(app: FastAPI) -> None:
+    """Tell FastAPI how to turn errors into JSON responses."""
+
+    @app.exception_handler(AppError)
+    async def handle_app_error(request: Request, exc: AppError) -> JSONResponse:
+        logger.warning("%s %s -> %d %s", request.method, request.url.path, exc.status_code, exc.message)
+        return error_response(exc.status_code, exc.message, exc.headers, exc.extra)
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        logger.info("%s %s -> 422 invalid input", request.method, request.url.path)
+        return error_response(status.HTTP_422_UNPROCESSABLE_CONTENT, jsonable_encoder(exc.errors()))
+
+    @app.exception_handler(StarletteHTTPException)
+    async def handle_http_exception(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        return error_response(exc.status_code, exc.detail, getattr(exc, "headers", None))
+
+
+app/models/order.py (replace)
+"""
+Order models: `orders` (the header) and `order_items` (its lines).
+
+Student notes:
+- Order status and payment status move together:
+      Pending Payment / Pending  -> order created, stock reserved, gateway being called
+      Confirmed       / Paid     -> the gateway approved the charge
+      Payment Failed  / Failed   -> declined or gateway down; stock released, can be retried
+      Confirmed       / Pending  -> Cash on Delivery: confirmed now, paid when delivered
+      Cancelled                  -> a failed order whose items went back to the cart
+  They are never left half-changed: both are saved in the same commit.
+- Order items COPY the product name and price at checkout time: if the price changes
+  tomorrow, yesterday's order still shows what the customer paid.
+- lazy="selectin": loading orders also loads their items with ONE extra query (no lazy
+  loading in async code, see models/cart.py).
+"""
+
+import enum
+from datetime import datetime
+from decimal import Decimal
+
+from sqlalchemy import DateTime, Enum, ForeignKey, Numeric, String, func
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.core import Base
+
+
+class OrderStatus(enum.Enum):
+    PENDING_PAYMENT = "Pending Payment"
+    CONFIRMED = "Confirmed"
+    PAYMENT_FAILED = "Payment Failed"
+    CANCELLED = "Cancelled"  # a failed order the customer gave up on (items went back to the cart)
+
+
+class PaymentStatus(enum.Enum):
+    PENDING = "Pending"
+    PAID = "Paid"
+    FAILED = "Failed"
+
+
+class PaymentMethod(enum.Enum):
+    """Chosen at checkout. Cash on Delivery skips the payment gateway: paid when delivered."""
+
+    CREDIT_CARD = "Credit Card"
+    CASH_ON_DELIVERY = "Cash on Delivery"
+
+
+class Order(Base):
+    """One row in the `orders` table."""
+
+    __tablename__ = "orders"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    order_number: Mapped[str] = mapped_column(String(20), unique=True, index=True)  # "ORD-3F2A9C1B7D"
+    # Who placed it: a user id, or NULL if that user was deleted.
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), index=True)
+    status: Mapped[OrderStatus] = mapped_column(Enum(OrderStatus), default=OrderStatus.PENDING_PAYMENT)
+    payment_status: Mapped[PaymentStatus] = mapped_column(Enum(PaymentStatus), default=PaymentStatus.PENDING)
+    payment_method: Mapped[PaymentMethod] = mapped_column(Enum(PaymentMethod), default=PaymentMethod.CREDIT_CARD)
+    payment_reference: Mapped[str | None] = mapped_column(String(40))  # from the gateway, e.g. "PAY-..."
+    failure_reason: Mapped[str | None] = mapped_column(String(255))
+    total_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    items: Mapped[list["OrderItem"]] = relationship(
+        back_populates="order", cascade="all, delete-orphan", lazy="selectin", order_by="OrderItem.id"
+    )
+
+
+class OrderItem(Base):
+    """One line of an order (the order_details table)."""
+
+    __tablename__ = "order_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"), index=True)
+    product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id", ondelete="SET NULL"))
+    product_name: Mapped[str] = mapped_column(String(120))  # copied at checkout
+    unit_price: Mapped[Decimal] = mapped_column(Numeric(10, 2))  # copied at checkout
+    quantity: Mapped[int]
+
+    order: Mapped[Order] = relationship(back_populates="items")
+
+
+app/models/__init__.py
+from app.models.order import Order, OrderItem, OrderStatus, PaymentMethod, PaymentStatus
+
+
+app/schemas/order.py (replace)
+"""Order and payment schemas."""
+
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field, computed_field
+
+from app.models import OrderStatus, PaymentMethod, PaymentStatus
+from app.schemas.common import Money
+
+
+class OrderItemOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    product_id: int | None
+    product_name: str
+    unit_price: Money
+    quantity: int
+
+    @computed_field
+    @property
+    def line_total(self) -> float:
+        return float(self.unit_price * self.quantity)
+
+
+class OrderOut(BaseModel):
+    """A full order, with its lines. Returned by checkout, order history, payment retry."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    order_number: str
+    user_id: int | None
+    status: OrderStatus
+    payment_status: PaymentStatus
+    payment_method: PaymentMethod
+    payment_reference: str | None
+    failure_reason: str | None
+    total_amount: Money
+    items: list[OrderItemOut]
+    created_at: datetime
+    updated_at: datetime
+
+
+class OrderSummaryOut(BaseModel):
+    """One row of the admin/support order list: no lines, just their count."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    order_number: str
+    user_id: int | None
+    status: OrderStatus
+    payment_status: PaymentStatus
+    total_amount: Money
+    items: list[OrderItemOut] = Field(exclude=True)  # read to count, not shown
+    created_at: datetime
+
+    @computed_field
+    @property
+    def item_count(self) -> int:
+        return sum(item.quantity for item in self.items)
+
+
+class CheckoutRequest(BaseModel):
+    """Body for POST /api/orders/checkout (optional: defaults to Credit Card)."""
+
+    payment_method: PaymentMethod = PaymentMethod.CREDIT_CARD
+
+
+class PaymentRequest(BaseModel):
+    """Body for POST /api/payments/process: retry the payment of a failed order."""
+
+    order_id: int = Field(gt=0)
+
+app/schemas/__init__.py
+from app.schemas.order import CheckoutRequest, OrderItemOut, OrderOut, OrderSummaryOut, PaymentRequest
+
+app/repositories/cart_repository.py
+    def stage(self, item: CartItem) -> None:
+        """Add a line WITHOUT committing: a multi-table flow commits everything together."""
+        self.db.add(item)
+
+app/services/order_service.py (replace)
+"""
+Order service: checkout, payment and order history.
+
+Student notes - the checkout flow (async end to end):
+  1. Load the cart. Empty cart -> 422.
+  2. Lock the products (SELECT ... FOR UPDATE) and check every line: active? enough stock?
+     Any problem -> 409, and NOTHING has been changed.
+  3. In ONE transaction: create the order "Pending Payment", copy prices into the order
+     items, subtract the stock (reserve it), empty the cart. Commit.
+  4. Cash on Delivery -> "Confirmed" now, paid when delivered (no gateway call).
+     Credit Card -> call the payment gateway (non-blocking HTTP, timeout + retry + circuit breaker).
+       approved          -> "Confirmed" / "Paid", payment reference stored
+       declined or down  -> "Payment Failed" / "Failed" saved, stock given back, then 402
+                            (PaymentFailedError) with the order id: never "Confirmed"
+     Order status and payment status are always saved together: never "Paid" + "Pending".
+  5. The route then schedules background tasks (confirmation e-mail, audit log).
+
+Why async here: step 4 waits on the network for up to seconds. With async, that waiting
+costs no worker thread; the event loop serves other customers meanwhile. The DB calls are
+async too (psycopg in async mode), so the whole flow never blocks.
+
+A failed payment can be:
+  - retried with POST /api/payments/process (retry_payment): stock reserved again, gateway
+    called again with the same Idempotency-Key, or
+  - given up with POST /api/orders/{id}/return-to-cart (return_to_cart): the order becomes
+    "Cancelled" and its items go back to the cart, so the customer can change the cart and
+    check out again (a NEW order).
+"""
+
+import logging
+import uuid
+from decimal import Decimal
+
+from app.core import BusinessRuleError, ConflictError, NotFoundError, PaymentFailedError, settings
+from app.integrations import PaymentDeclinedError, PaymentGatewayError, PaymentGatewayPort
+from app.models import CartItem, Order, OrderItem, OrderStatus, PaymentMethod, PaymentStatus, Product
+from app.repositories import CartRepository, OrderRepository, ProductRepository
+
+logger = logging.getLogger(__name__)
+
+
+def new_order_number() -> str:
+    """ "ORD-" + 10 random hex characters, e.g. ORD-3F2A9C1B7D. Unguessable, unlike an id."""
+    return f"ORD-{uuid.uuid4().hex[:10].upper()}"
+
+
+class OrderService:
+    def __init__(
+        self,
+        repository: OrderRepository,
+        cart: CartRepository,
+        products: ProductRepository,
+        gateway: PaymentGatewayPort,
+    ):
+        self.repository = repository
+        self.cart = cart
+        self.products = products
+        self.gateway = gateway
+
+    async def checkout(self, user_id: int, payment_method: PaymentMethod = PaymentMethod.CREDIT_CARD) -> Order:
+        lines = await self.cart.get_for_user(user_id)
+        if not lines:
+            raise BusinessRuleError("Your cart is empty")
+
+        products = await self._reserve_stock({line.product_id: line.quantity for line in lines})
+
+        order = Order(
+            order_number=new_order_number(),
+            user_id=user_id,
+            status=OrderStatus.PENDING_PAYMENT,
+            payment_status=PaymentStatus.PENDING,
+            payment_method=payment_method,
+            total_amount=Decimal("0.00"),
+        )
+        for line in lines:
+            product = products[line.product_id]
+            order.items.append(
+                OrderItem(
+                    product_id=product.id,
+                    product_name=product.name,  # copied: later renames don't change old orders
+                    unit_price=product.price,  # copied: later price changes don't either
+                    quantity=line.quantity,
+                )
+            )
+        order.total_amount = sum((item.unit_price * item.quantity for item in order.items), Decimal("0.00"))
+
+        await self.repository.add_pending(order)
+        await self.cart.clear_for_user(user_id)
+        await self.repository.commit()  # order + reserved stock + empty cart: all or nothing
+        logger.info(
+            "Order %s created, total %s",
+            order.order_number,
+            order.total_amount,
+            extra={"context": {"order_id": order.id, "user_id": user_id}},
+        )
+        if payment_method == PaymentMethod.CASH_ON_DELIVERY:
+            # No gateway call: the order is confirmed now and paid in cash on delivery.
+            order.status = OrderStatus.CONFIRMED
+            return await self.repository.save(order)
+        return await self._charge(order)
+
+    async def retry_payment(self, order: Order) -> Order:
+        """Pay a "Payment Failed" order again. Ownership was checked by the route."""
+        if order.payment_status == PaymentStatus.PAID:
+            raise ConflictError(f"Order {order.order_number} is already paid")
+        if order.status != OrderStatus.PAYMENT_FAILED:
+            raise ConflictError(
+                f"Order {order.order_number} is '{order.status.value}'; only failed payments can be retried"
+            )
+        if any(item.product_id is None for item in order.items):
+            raise ConflictError(f"Order {order.order_number} contains a product that no longer exists")
+
+        await self._reserve_stock({item.product_id: item.quantity for item in order.items if item.product_id})
+        order.status = OrderStatus.PENDING_PAYMENT
+        order.payment_status = PaymentStatus.PENDING
+        order.failure_reason = None
+        await self.repository.save(order)  # stock reserved again + status, one commit
+        return await self._charge(order)
+
+    async def return_to_cart(self, order: Order) -> Order:
+        """
+        The customer gave up on a "Payment Failed" order and wants to change it: put its items
+        back into their cart and cancel the order. They can then add or remove items and check
+        out again, which creates a NEW order. Ownership was checked by the route.
+
+        - Only "Payment Failed" orders: a paid order can't be undone this way (409).
+        - Stock needs no change: it was already released when the payment failed.
+        - An item already in the cart is merged (quantities added up, capped at the per-product limit).
+        - Cart lines + cancelled order are saved in ONE commit: all or nothing.
+        """
+        if order.status != OrderStatus.PAYMENT_FAILED:
+            raise ConflictError(
+                f"Order {order.order_number} is '{order.status.value}'; only orders whose payment failed "
+                "can be moved back to the cart"
+            )
+        for item in order.items:
+            if item.product_id is None:  # the product was deleted meanwhile
+                continue
+            line = await self.cart.get_line(order.user_id, item.product_id)
+            if line is not None:
+                line.quantity = min(line.quantity + item.quantity, settings.max_quantity_per_item)
+            else:
+                self.cart.stage(CartItem(user_id=order.user_id, product_id=item.product_id, quantity=item.quantity))
+        order.status = OrderStatus.CANCELLED
+        order.failure_reason = "Cancelled by the customer; items moved back to the cart"
+        logger.info(
+            "Order %s cancelled, items back in the cart", order.order_number, extra={"context": {"order_id": order.id}}
+        )
+        return await self.repository.save(order)
+
+    async def list_my_orders(self, user_id: int) -> list[Order]:
+        return await self.repository.list_for_user(user_id)
+
+    async def list_orders(self, status: OrderStatus | None = None) -> list[Order]:
+        return await self.repository.list_all(status)
+
+    async def get_order(self, order_id: int) -> Order:
+        order = await self.repository.get_by_id(order_id)
+        if order is None:
+            raise NotFoundError(f"Order {order_id} not found")
+        return order
+
+    async def _charge(self, order: Order) -> Order:
+        """
+        Call the gateway and record the outcome.
+
+        Approved -> "Confirmed" / "Paid" (returned).
+        Declined or gateway down -> "Payment Failed" / "Failed" is SAVED first, the stock is
+        released, and then PaymentFailedError (402) is raised with the order id, so the client
+        knows the order was not placed and which order to retry.
+        """
+        try:
+            reference = await self.gateway.charge(order.order_number, order.total_amount, settings.currency)
+        except PaymentDeclinedError as exc:
+            reason = f"Payment declined: {exc}"
+        except PaymentGatewayError as exc:
+            reason = f"Payment service unavailable: {exc}"
+        else:
+            order.status = OrderStatus.CONFIRMED
+            order.payment_status = PaymentStatus.PAID
+            order.payment_reference = reference
+            logger.info("Order %s paid (%s)", order.order_number, reference, extra={"context": {"order_id": order.id}})
+            return await self.repository.save(order)
+
+        # FALLBACK: keep the order (never Confirmed), give the stock back, let the customer retry.
+        await self._release_stock(order)
+        order.status = OrderStatus.PAYMENT_FAILED
+        order.payment_status = PaymentStatus.FAILED
+        order.failure_reason = reason[:255]
+        await self.repository.save(order)  # the failed state is stored BEFORE we answer
+        logger.warning("Order %s: %s", order.order_number, reason, extra={"context": {"order_id": order.id}})
+        raise PaymentFailedError(
+            f"{reason}. Retry with POST /api/payments/process",
+            order_id=order.id,
+            order_number=order.order_number,
+        )
+
+    async def _reserve_stock(self, wanted: dict[int, int]) -> dict[int, Product]:
+        """Lock the products, check EVERY line first, then subtract. {product_id: quantity}."""
+        products = await self.products.get_many_for_update(list(wanted))
+        problem = None
+        for product_id, quantity in wanted.items():
+            product = products.get(product_id)
+            if product is None or not product.is_active:
+                problem = f"Product {product_id} is no longer available"
+            elif product.stock < quantity:
+                problem = f"Only {product.stock} of '{product.name}' left in stock"
+            if problem:
+                # Nothing was changed yet. The request's session is closed right after the
+                # error response, which rolls back and releases the row locks.
+                raise ConflictError(problem)
+        for product_id, quantity in wanted.items():
+            products[product_id].stock -= quantity
+        return products
+
+    async def _release_stock(self, order: Order) -> None:
+        """Give back the stock reserved for an order whose payment failed (saved by the caller)."""
+        ids = [item.product_id for item in order.items if item.product_id is not None]
+        products = await self.products.get_many_for_update(ids)
+        for item in order.items:
+            product = products.get(item.product_id) if item.product_id is not None else None
+            if product is not None:
+                product.stock += item.quantity
+
+app/routes/orders.py (replace)
+"""
+Order routes: checkout, my order history, one order, move a failed order back to the cart.
+
+Student notes:
+- Checkout is the flow refactored from sync (Week 2) to ASYNC: see services/order_service.py.
+  The response comes back as soon as the order is saved and the payment answered; the
+  confirmation e-mail and the audit row are background tasks, sent after the response.
+- Checkout answers 201 ONLY when the order is confirmed. If the payment fails, the order is
+  saved as "Payment Failed" (never "Confirmed") and the answer is 402 with the order id:
+  {"detail": "...", "order_id": 7, "order_number": "ORD-...", "request_id": "..."}.
+  The client retries with POST /api/payments/process {"order_id": 7}, or gives up with
+  POST /api/orders/7/return-to-cart.
+- /orders/me is declared BEFORE /orders/{order_id}, otherwise "me" would be read as an id.
+"""
+
+from typing import Annotated
+
+from fastapi import APIRouter, Body, Depends, status
+
+from app.models import OrderStatus, User
+from app.policy import check_permission
+from app.routes.dependencies import AuditDep, CurrentUser, NotificationsDep, OrderServiceDep, authorize
+from app.schemas import CheckoutRequest, OrderOut
+
+router = APIRouter(prefix="/api/orders", tags=["Orders"])
+
+
+@router.post("/checkout", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
+async def checkout(
+    user: Annotated[User, Depends(authorize("orders", "checkout"))],
+    service: OrderServiceDep,
+    notifications: NotificationsDep,
+    audit: AuditDep,
+    data: Annotated[CheckoutRequest | None, Body()] = None,
+):
+    """
+    Turn the cart into an order and pay for it.
+
+    422 empty cart, 409 a product is unavailable or out of stock (nothing is changed).
+    Body (optional): {"payment_method": "Credit Card"} or {"payment_method": "Cash on Delivery"}.
+    Cash on Delivery: confirmed at once, payment "Pending" until delivery (no gateway call).
+    Payment declined or gateway down: 402 with order_id; the order is "Payment Failed", stock released.
+    """
+    payment_method = (data or CheckoutRequest()).payment_method
+    order = await service.checkout(user.id, payment_method)
+    audit.record(user.id, "checkout", "orders", order.id, f"{order.order_number}: {order.status.value}")
+    if order.status == OrderStatus.CONFIRMED:
+        notifications.order_confirmed(order.id)  # runs after the response is sent
+    return order
+
+
+@router.get("/me", response_model=list[OrderOut])
+async def my_orders(user: Annotated[User, Depends(authorize("orders", "read_own"))], service: OrderServiceDep):
+    """The caller's orders, newest first; [] if there are none."""
+    return await service.list_my_orders(user.id)
+
+
+@router.get("/{order_id}", response_model=OrderOut)
+async def get_order(order_id: int, current_user: CurrentUser, service: OrderServiceDep):
+    """One order. Customers: only their own (403). Support and admins: any order."""
+    order = await service.get_order(order_id)
+    # ABAC: the answer depends on who placed this order.
+    check_permission(current_user, "orders", "read", owner_id=order.user_id)
+    return order
+
+
+@router.post("/{order_id}/return-to-cart", response_model=OrderOut)
+async def return_order_to_cart(order_id: int, current_user: CurrentUser, service: OrderServiceDep, audit: AuditDep):
+    """
+    Cancel a "Payment Failed" order and put its items back into the cart, so the customer can
+    change the cart (add or remove items) and check out again.
+
+    403 someone else's order, 404 unknown order, 409 the order isn't "Payment Failed".
+    """
+    order = await service.get_order(order_id)
+    # ABAC: only the customer who placed the order.
+    check_permission(current_user, "orders", "return_to_cart", owner_id=order.user_id)
+    order = await service.return_to_cart(order)
+    audit.record(current_user.id, "return_to_cart", "orders", order.id, order.order_number)
+    return order
+
+
+app/background_tasks.py
+            + (
+                f"Payment reference: {order.payment_reference}."
+                if order.payment_reference
+                else f"Payment: {order.payment_method.value}."
+            )
+
+
+app/policy/policy.csv
+p, customer, orders, return_to_cart, r.user_id == r.owner_id
+
+tests/fakes.py
+    def stage(self, item: CartItem) -> None:
+        item.id = self.next_id
+        self.next_id += 1
+        self.rows[item.id] = item
+
+tests/test_api_cart_orders.py 
+"""
+API tests for cart, checkout, payments and notifications: the main business flow,
+including the async/integration paths (gateway down, declined, retried, moved back to cart).
+"""
+
+import pytest
+
+from app.models import UserRole
+from tests.conftest import create_product, create_user
+
+pytestmark = [pytest.mark.anyio, pytest.mark.integration]
+
+
+async def add(client, product_id: int, quantity: int = 1):
+    return await client.post("/api/cart/add", json={"product_id": product_id, "quantity": quantity})
+
+
+async def stock_of(client, product_id: int) -> int:
+    return (await client.get(f"/api/products/{product_id}")).json()["stock"]
+
+
+# ---- Cart -----------------------------------------------------------------------------------
+
+
+async def test_cart_needs_a_token(client):
+    response = await client.get("/api/cart")
+
+    assert response.status_code == 401
+
+
+async def test_add_to_cart(client, customer, product, login_as):
+    login_as(customer)
+
+    response = await add(client, product.id, 2)
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["total_items"] == 2
+    assert body["total"] == 998.0
+    assert body["items"][0]["available"] is True
+
+
+async def test_adding_the_same_product_again_adds_up(client, customer, product, login_as):
+    login_as(customer)
+    await add(client, product.id, 1)
+
+    response = await add(client, product.id, 2)
+
+    assert len(response.json()["items"]) == 1
+    assert response.json()["items"][0]["quantity"] == 3
+
+
+async def test_add_more_than_stock_is_409(client, db, customer, category, login_as):
+    login_as(customer)
+    scarce = await create_product(db, category.id, sku="HOME-003", name="Chef's Knife", stock=3)
+
+    response = await add(client, scarce.id, 5)
+
+    assert response.status_code == 409
+
+
+async def test_add_more_than_per_product_limit_is_422(client, db, customer, category, login_as):
+    login_as(customer)
+    plenty = await create_product(db, category.id, sku="CLTH-001", name="T-Shirt", stock=500)
+
+    response = await add(client, plenty.id, 11)
+
+    assert response.status_code == 422
+
+
+async def test_add_unknown_product_is_404(client, customer, login_as):
+    login_as(customer)
+
+    response = await add(client, 999)
+
+    assert response.status_code == 404
+
+
+async def test_admin_has_no_cart(client, admin, product, login_as):
+    login_as(admin)
+
+    response = await add(client, product.id)
+
+    assert response.status_code == 403
+
+
+async def test_update_cart_item(client, customer, product, login_as):
+    login_as(customer)
+    item_id = (await add(client, product.id)).json()["items"][0]["id"]
+
+    response = await client.put(f"/api/cart/update/{item_id}", json={"quantity": 4})
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["quantity"] == 4
+
+
+async def test_cannot_touch_someone_elses_cart_item(client, customer, other_customer, product, login_as):
+    login_as(customer)
+    item_id = (await add(client, product.id)).json()["items"][0]["id"]
+    login_as(other_customer)
+
+    update = await client.put(f"/api/cart/update/{item_id}", json={"quantity": 4})
+    remove = await client.delete(f"/api/cart/remove/{item_id}")
+
+    assert update.status_code == 403
+    assert remove.status_code == 403
+
+
+async def test_remove_cart_item(client, customer, product, login_as):
+    login_as(customer)
+    item_id = (await add(client, product.id)).json()["items"][0]["id"]
+
+    response = await client.delete(f"/api/cart/remove/{item_id}")
+
+    assert response.status_code == 204
+    assert (await client.get("/api/cart")).json()["items"] == []
+
+
+# ---- Checkout -------------------------------------------------------------------------------
+
+
+async def test_checkout_confirms_the_order(client, customer, product, login_as, notifier):
+    login_as(customer)
+    await add(client, product.id, 2)
+
+    response = await client.post("/api/orders/checkout")
+
+    assert response.status_code == 201
+    order = response.json()
+    assert (order["status"], order["payment_status"]) == ("Confirmed", "Paid")
+    assert order["order_number"].startswith("ORD-")
+    assert order["payment_reference"].startswith("PAY-")
+    assert order["total_amount"] == 998.0
+    assert order["items"][0]["line_total"] == 998.0
+    assert await stock_of(client, product.id) == 8  # stock taken
+    assert (await client.get("/api/cart")).json()["items"] == []  # cart emptied
+    # The confirmation e-mail was sent by a background task, after the response.
+    assert [mail["to"] for mail in notifier.sent] == ["customer@example.com"]
+
+
+async def test_cash_on_delivery_is_confirmed_without_the_gateway(client, customer, product, login_as, payment_gateway):
+    login_as(customer)
+    payment_gateway.mode = "down"  # would fail a card payment
+    await add(client, product.id, 2)
+
+    response = await client.post("/api/orders/checkout", json={"payment_method": "Cash on Delivery"})
+
+    assert response.status_code == 201
+    order = response.json()
+    assert (order["status"], order["payment_status"], order["payment_method"]) == (
+        "Confirmed",
+        "Pending",
+        "Cash on Delivery",
+    )
+    assert payment_gateway.charges == []
+
+
+async def test_checkout_with_empty_cart_is_422(client, customer, login_as):
+    login_as(customer)
+
+    response = await client.post("/api/orders/checkout")
+
+    assert response.status_code == 422
+
+
+async def test_checkout_of_a_deactivated_product_is_409(client, db, customer, product, login_as):
+    login_as(customer)
+    await add(client, product.id)
+    product.is_active = False
+    await db.commit()
+
+    response = await client.post("/api/orders/checkout")
+
+    assert response.status_code == 409
+    assert len((await client.get("/api/cart")).json()["items"]) == 1  # nothing changed
+
+
+async def test_failed_payment_is_402_and_order_is_never_confirmed(
+    client, customer, product, login_as, payment_gateway, notifier
+):
+    login_as(customer)
+    payment_gateway.mode = "down"
+    await add(client, product.id, 2)
+
+    response = await client.post("/api/orders/checkout")
+
+    assert response.status_code == 402  # not a 201 that looks like success
+    body = response.json()
+    assert "unavailable" in body["detail"]
+    assert body["order_number"].startswith("ORD-")
+    order = (await client.get(f"/api/orders/{body['order_id']}")).json()
+    assert (order["status"], order["payment_status"]) == ("Payment Failed", "Failed")
+    assert await stock_of(client, product.id) == 10  # stock released
+    assert notifier.sent == []  # no confirmation for an unpaid order
+
+
+async def test_declined_payment_is_402(client, customer, product, login_as, payment_gateway):
+    login_as(customer)
+    payment_gateway.mode = "decline"
+    await add(client, product.id)
+
+    response = await client.post("/api/orders/checkout")
+
+    assert response.status_code == 402
+    assert "declined" in response.json()["detail"]
+
+
+async def test_a_failed_payment_can_be_retried(client, customer, product, login_as, payment_gateway, notifier):
+    login_as(customer)
+    payment_gateway.mode = "down"
+    await add(client, product.id, 2)
+    order_id = (await client.post("/api/orders/checkout")).json()["order_id"]
+    payment_gateway.mode = "approve"  # the gateway is back
+
+    response = await client.post("/api/payments/process", json={"order_id": order_id})
+
+    assert response.status_code == 200
+    assert (response.json()["status"], response.json()["payment_status"]) == ("Confirmed", "Paid")
+    assert await stock_of(client, product.id) == 8
+    assert len(notifier.sent) == 1
+
+
+async def test_a_retry_that_fails_again_is_402(client, customer, product, login_as, payment_gateway):
+    login_as(customer)
+    payment_gateway.mode = "down"
+    await add(client, product.id, 2)
+    order_id = (await client.post("/api/orders/checkout")).json()["order_id"]
+
+    response = await client.post("/api/payments/process", json={"order_id": order_id})
+
+    assert response.status_code == 402
+    assert response.json()["order_id"] == order_id
+    assert await stock_of(client, product.id) == 10  # released again
+
+
+async def test_retrying_a_paid_order_is_409(client, customer, product, login_as):
+    login_as(customer)
+    await add(client, product.id)
+    order_id = (await client.post("/api/orders/checkout")).json()["id"]
+
+    response = await client.post("/api/payments/process", json={"order_id": order_id})
+
+    assert response.status_code == 409
+
+
+async def test_cannot_pay_someone_elses_order(client, customer, other_customer, product, login_as, payment_gateway):
+    login_as(customer)
+    payment_gateway.mode = "down"
+    await add(client, product.id)
+    order_id = (await client.post("/api/orders/checkout")).json()["order_id"]
+    login_as(other_customer)
+
+    response = await client.post("/api/payments/process", json={"order_id": order_id})
+
+    assert response.status_code == 403
+
+
+async def test_broken_mail_service_does_not_break_checkout(client, customer, product, login_as, notifier):
+    login_as(customer)
+    notifier.fail = True
+    await add(client, product.id)
+
+    response = await client.post("/api/orders/checkout")
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "Confirmed"
+
+
+# ---- Order history and access ----------------------------------------------------------------
+
+
+async def test_my_orders_lists_only_my_orders(client, customer, other_customer, product, login_as):
+    login_as(customer)
+    await add(client, product.id)
+    await client.post("/api/orders/checkout")
+    login_as(other_customer)
+    await add(client, product.id)
+    await client.post("/api/orders/checkout")
+
+    response = await client.get("/api/orders/me")
+
+    assert [o["user_id"] for o in response.json()] == [other_customer.id]
+
+
+async def test_customer_reads_only_own_orders(client, customer, other_customer, product, login_as):
+    login_as(customer)
+    await add(client, product.id)
+    order_id = (await client.post("/api/orders/checkout")).json()["id"]
+
+    own = await client.get(f"/api/orders/{order_id}")
+    login_as(other_customer)
+    foreign = await client.get(f"/api/orders/{order_id}")
+
+    assert own.status_code == 200
+    assert foreign.status_code == 403  # ABAC: depends on who placed the order
+
+
+async def test_support_reads_any_order(client, customer, support, product, login_as):
+    login_as(customer)
+    await add(client, product.id)
+    order_id = (await client.post("/api/orders/checkout")).json()["id"]
+    login_as(support)
+
+    single = await client.get(f"/api/orders/{order_id}")
+    summaries = await client.get("/api/admin/orders", params={"status": "Confirmed"})
+
+    assert single.status_code == 200
+    assert [(o["id"], o["item_count"]) for o in summaries.json()] == [(order_id, 1)]
+
+
+async def test_get_unknown_order_is_404(client, support, login_as):
+    login_as(support)
+
+    response = await client.get("/api/orders/999")
+
+    assert response.status_code == 404
+
+
+# ---- Notifications --------------------------------------------------------------------------
+
+
+async def test_support_sends_a_notification(client, db, customer, support, login_as, notifier):
+    login_as(support)
+
+    response = await client.post(
+        "/api/notifications/send",
+        json={"user_id": customer.id, "subject": "About your order", "message": "It ships tomorrow."},
+    )
+
+    assert response.status_code == 202
+    assert notifier.sent[0]["to"] == "customer@example.com"
+
+
+async def test_customer_cannot_send_notifications(client, db, customer, login_as):
+    login_as(customer)
+    someone = await create_user(db, "someone", UserRole.CUSTOMER)
+
+    response = await client.post(
+        "/api/notifications/send", json={"user_id": someone.id, "subject": "Hi", "message": "Hello"}
+    )
+
+    assert response.status_code == 403
+
+
+async def test_notification_to_unknown_user_is_404(client, support, login_as):
+    login_as(support)
+
+    response = await client.post("/api/notifications/send", json={"user_id": 999, "subject": "Hi", "message": "Hi"})
+
+    assert response.status_code == 404
+
+
+# ---- Changing a failed order: move its items back to the cart -------------------------------
+
+
+async def test_failed_order_items_go_back_to_the_cart(
+    client, db, customer, category, product, login_as, payment_gateway
+):
+    login_as(customer)
+    payment_gateway.mode = "down"
+    await add(client, product.id, 2)
+    order_id = (await client.post("/api/orders/checkout")).json()["order_id"]
+
+    response = await client.post(f"/api/orders/{order_id}/return-to-cart")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "Cancelled"
+    cart = (await client.get("/api/cart")).json()
+    assert [(line["product_id"], line["quantity"]) for line in cart["items"]] == [(product.id, 2)]
+    assert await stock_of(client, product.id) == 10  # nothing reserved by the cancelled order
+
+    # ... the customer changes their mind, adds one more product, and checks out again
+    extra = await create_product(db, category.id, sku="ELEC-002", name="Charger", price="100.00")
+    await add(client, extra.id, 1)
+    payment_gateway.mode = "approve"
+    new_order = (await client.post("/api/orders/checkout")).json()
+
+    assert new_order["id"] != order_id  # a NEW order
+    assert new_order["status"] == "Confirmed"
+    assert new_order["total_amount"] == 1098.0  # 2 x 499 + 100
+    retry = await client.post("/api/payments/process", json={"order_id": order_id})
+    assert retry.status_code == 409  # the cancelled order can't be paid any more
+
+
+async def test_returned_items_merge_with_the_cart(client, customer, product, login_as, payment_gateway):
+    login_as(customer)
+    payment_gateway.mode = "down"
+    await add(client, product.id, 2)
+    order_id = (await client.post("/api/orders/checkout")).json()["order_id"]
+    await add(client, product.id, 1)  # same product added again meanwhile
+
+    await client.post(f"/api/orders/{order_id}/return-to-cart")
+
+    items = (await client.get("/api/cart")).json()["items"]
+    assert [line["quantity"] for line in items] == [3]  # one line, quantities added up
+
+
+async def test_a_confirmed_order_cannot_go_back_to_the_cart(client, customer, product, login_as):
+    login_as(customer)
+    await add(client, product.id)
+    order_id = (await client.post("/api/orders/checkout")).json()["id"]
+
+    response = await client.post(f"/api/orders/{order_id}/return-to-cart")
+
+    assert response.status_code == 409
+
+
+async def test_cannot_return_someone_elses_order(client, customer, other_customer, product, login_as, payment_gateway):
+    login_as(customer)
+    payment_gateway.mode = "down"
+    await add(client, product.id)
+    order_id = (await client.post("/api/orders/checkout")).json()["order_id"]
+    login_as(other_customer)
+
+    response = await client.post(f"/api/orders/{order_id}/return-to-cart")
+
+    assert response.status_code == 403
+
+
+tests/test_order_service.py 
+"""
+Unit tests for OrderService: the checkout/payment rules, with fake repositories and a fake
+payment gateway (mocked dependencies: no database, no network).
+"""
+
+from decimal import Decimal
+from types import SimpleNamespace
+
+import pytest
+
+from app.core import BusinessRuleError, ConflictError, NotFoundError, PaymentFailedError
+from app.models import CartItem, OrderStatus, PaymentMethod, PaymentStatus, Product
+from app.services import OrderService
+from tests.fakes import FakeCartRepository, FakeOrderRepository, FakePaymentGateway, FakeProductRepository
+
+pytestmark = pytest.mark.anyio
+
+USER_ID = 1
+
+
+@pytest.fixture
+def shop():
+    """A product with 5 in stock, a cart holding 2 of it, and the service under test."""
+    products = FakeProductRepository()
+    product = Product(
+        id=1, sku="ELEC-001", name="Headphones", price=Decimal("499.50"), stock=5, category_id=1, is_active=True
+    )
+    products.rows[1] = product
+    cart = FakeCartRepository()
+    cart.rows[1] = CartItem(id=1, user_id=USER_ID, product_id=1, product=product, quantity=2)
+    gateway = FakePaymentGateway()
+    orders = FakeOrderRepository()
+    service = OrderService(orders, cart, products, gateway)  # type: ignore[arg-type]
+    return SimpleNamespace(service=service, product=product, cart=cart, gateway=gateway, orders=orders)
+
+
+async def test_checkout_confirms_and_takes_stock(shop):
+    order = await shop.service.checkout(USER_ID)
+
+    assert (order.status, order.payment_status) == (OrderStatus.CONFIRMED, PaymentStatus.PAID)
+    assert order.total_amount == Decimal("999.00")
+    assert order.items[0].unit_price == Decimal("499.50")  # price copied into the order
+    assert shop.product.stock == 3
+    assert shop.cart.rows == {}
+    assert shop.gateway.charges == [(order.order_number, Decimal("999.00"))]
+
+
+async def test_cash_on_delivery_skips_the_gateway(shop):
+    order = await shop.service.checkout(USER_ID, PaymentMethod.CASH_ON_DELIVERY)
+
+    assert (order.status, order.payment_status) == (OrderStatus.CONFIRMED, PaymentStatus.PENDING)
+    assert shop.gateway.charges == []
+    assert shop.product.stock == 3  # stock is still reserved
+
+
+async def test_empty_cart_is_rejected(shop):
+    shop.cart.rows.clear()
+
+    with pytest.raises(BusinessRuleError):
+        await shop.service.checkout(USER_ID)
+
+
+async def test_not_enough_stock_changes_nothing(shop):
+    shop.product.stock = 1
+
+    with pytest.raises(ConflictError):
+        await shop.service.checkout(USER_ID)
+
+    assert shop.product.stock == 1
+    assert shop.orders.rows == {}
+    assert shop.gateway.charges == []
+
+
+async def failed_checkout(shop) -> tuple[object, PaymentFailedError]:
+    """Check out while the gateway fails; return the saved order and the raised error."""
+    with pytest.raises(PaymentFailedError) as error:
+        await shop.service.checkout(USER_ID)
+    return shop.orders.rows[error.value.extra["order_id"]], error.value
+
+
+async def test_gateway_down_raises_402_and_saves_a_failed_order(shop):
+    shop.gateway.mode = "down"
+
+    order, error = await failed_checkout(shop)
+
+    assert error.status_code == 402
+    assert error.extra["order_number"] == order.order_number
+    assert (order.status, order.payment_status) == (OrderStatus.PAYMENT_FAILED, PaymentStatus.FAILED)
+    assert order.failure_reason.startswith("Payment service unavailable")
+    assert shop.product.stock == 5  # released
+
+
+async def test_declined_payment_is_recorded(shop):
+    shop.gateway.mode = "decline"
+
+    order, error = await failed_checkout(shop)
+
+    assert order.status == OrderStatus.PAYMENT_FAILED
+    assert error.message.startswith("Payment declined")
+
+
+async def test_retry_after_failure(shop):
+    shop.gateway.mode = "down"
+    order, _ = await failed_checkout(shop)
+    shop.gateway.mode = "approve"
+
+    order = await shop.service.retry_payment(order)
+
+    assert (order.status, order.payment_status) == (OrderStatus.CONFIRMED, PaymentStatus.PAID)
+    assert order.failure_reason is None
+    assert shop.product.stock == 3
+
+
+async def test_retry_of_a_paid_order_is_rejected(shop):
+    order = await shop.service.checkout(USER_ID)
+
+    with pytest.raises(ConflictError):
+        await shop.service.retry_payment(order)
+
+
+async def test_retry_without_stock_is_rejected(shop):
+    shop.gateway.mode = "down"
+    order, _ = await failed_checkout(shop)
+    shop.product.stock = 0  # sold out meanwhile
+
+    with pytest.raises(ConflictError):
+        await shop.service.retry_payment(order)
+
+
+async def test_unknown_order_is_not_found(shop):
+    with pytest.raises(NotFoundError):
+        await shop.service.get_order(999)
+
+
+async def test_return_to_cart_cancels_and_refills_the_cart(shop):
+    shop.gateway.mode = "down"
+    order, _ = await failed_checkout(shop)
+
+    order = await shop.service.return_to_cart(order)
+
+    assert order.status == OrderStatus.CANCELLED
+    assert [(line.product_id, line.quantity) for line in shop.cart.rows.values()] == [(1, 2)]
+    assert shop.product.stock == 5  # unchanged: released when the payment failed
+
+
+async def test_only_failed_orders_go_back_to_the_cart(shop):
+    order = await shop.service.checkout(USER_ID)  # paid
+
+    with pytest.raises(ConflictError):
+        await shop.service.return_to_cart(order)
+
+
+src/api/client.js 
+1. 
+   * @param {Object<string,string>} fieldErrors  e.g. { email: "value is not a valid email" }
+   * @param {object} body         the whole error body, for extra fields such as order_id (402)
+   */
+  constructor(message, status, requestId = null, fieldErrors = {}, body = {}) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.requestId = requestId;
+    this.fieldErrors = fieldErrors;
+    this.body = body;
+  }
+
+2.
+  return new ApiError(message, status, body?.request_id ?? null, fieldErrors, body ?? {});
+
+src/api/orderApi.js (replace)
+/** Order and payment endpoints (backend: app/routes/orders.py, payments.py). Customer token required. */
+import { apiRequest } from "./client";
+
+/** The two payment methods the checkout offers (the backend's PaymentMethod values). */
+export const PAYMENT_METHODS = {
+  CREDIT_CARD: "Credit Card",
+  CASH_ON_DELIVERY: "Cash on Delivery",
+};
+
+/** GET /api/orders/me - only the logged-in user's orders, newest first. */
+export function fetchMyOrders() {
+  return apiRequest("/api/orders/me");
+}
+
+/** GET /api/orders/{id} - 403 if the order belongs to someone else, 404 if it doesn't exist. */
+export function fetchOrder(orderId) {
+  return apiRequest(`/api/orders/${orderId}`);
+}
+
+/**
+ * POST /api/orders/checkout - turn the cart into an order.
+ * 201: confirmed order. 402: payment failed - the error's body has order_id (order saved
+ * as "Payment Failed", never confirmed). 409: out of stock. 422: empty cart.
+ */
+export function placeOrder(paymentMethod) {
+  return apiRequest("/api/orders/checkout", { method: "POST", body: { payment_method: paymentMethod } });
+}
+
+/** POST /api/payments/process - pay a "Payment Failed" order again. 402 if it fails again. */
+export function retryPayment(orderId) {
+  return apiRequest("/api/payments/process", { method: "POST", body: { order_id: orderId } });
+}
+
+/** POST /api/orders/{id}/return-to-cart - cancel a failed order and put its items back in the cart. */
+export function returnToCart(orderId) {
+  return apiRequest(`/api/orders/${orderId}/return-to-cart`, { method: "POST" });
+}
+
+
+src/pages/CheckoutPage.jsx (new)
+/**
+ * Checkout page: review the order, choose a payment method (Credit Card or Cash on Delivery)
+ * and place the order with POST /api/orders/checkout.
+ *
+ * - Place Order is disabled while the request runs (no double orders on a double click).
+ * - 201 (Credit Card paid, or Cash on Delivery): go to the new order, "Your order has been placed".
+ * - 402 (payment declined or gateway down): the order was saved as "Payment Failed" and the
+ *   cart was emptied. The error body carries order_id, so we open that order, where the
+ *   customer can Retry Payment or Move items back to cart.
+ * - 409 (out of stock) / 422 (empty cart): nothing was changed; the message is shown here.
+ */
+import { useEffect, useState } from "react";
+import { Link, Navigate, useNavigate } from "react-router-dom";
+import { PAYMENT_METHODS, placeOrder } from "../api/orderApi";
+import Alert, { errorText } from "../components/common/Alert";
+import Loader from "../components/common/Loader";
+import OrderItemsTable from "../components/orders/OrderItemsTable";
+import { useCart } from "../context/CartContext";
+
+export default function CheckoutPage() {
+  const { cart, refreshCart } = useCart();
+  const navigate = useNavigate();
+  const [ready, setReady] = useState(false); // true once the latest cart is loaded
+  const [paymentMethod, setPaymentMethod] = useState(PAYMENT_METHODS.CREDIT_CARD);
+  const [submitting, setSubmitting] = useState(false);
+  const [serverError, setServerError] = useState("");
+
+  // Review the CURRENT cart (prices and stock may have changed since it was last loaded).
+  useEffect(() => {
+    refreshCart().finally(() => setReady(true));
+  }, [refreshCart]);
+
+  if (!ready) return <Loader text="Loading your order..." />;
+  if (cart.items.length === 0 && !submitting) return <Navigate to="/cart" replace />;
+
+  async function handlePlaceOrder() {
+    setSubmitting(true);
+    setServerError("");
+    try {
+      const order = await placeOrder(paymentMethod);
+      await refreshCart(); // the backend emptied the cart
+      navigate(`/orders/${order.id}`, { state: { justPlaced: true } });
+    } catch (error) {
+      if (error.status === 402 && error.body.order_id) {
+        await refreshCart(); // the order exists (Payment Failed) and the cart was emptied
+        navigate(`/orders/${error.body.order_id}`);
+        return;
+      }
+      setServerError(errorText(error)); // e.g. 409 out of stock: nothing was changed
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <section className="page narrow">
+      <h1>Checkout</h1>
+      <Alert>{serverError}</Alert>
+
+      <h2>Review your order</h2>
+      <OrderItemsTable items={cart.items} total={cart.total} />
+
+      <fieldset className="payment-methods" disabled={submitting}>
+        <legend>Payment method</legend>
+        {Object.values(PAYMENT_METHODS).map((method) => (
+          <label key={method} className="radio">
+            <input
+              type="radio"
+              name="paymentMethod"
+              value={method}
+              checked={paymentMethod === method}
+              onChange={(event) => setPaymentMethod(event.target.value)}
+            />
+            {method}
+          </label>
+        ))}
+      </fieldset>
+
+      <div className="form-actions">
+        <button type="button" className="btn btn-success" onClick={handlePlaceOrder} disabled={submitting}>
+          {submitting ? "Placing order..." : "Place Order"}
+        </button>
+        <Link to="/cart" className="btn btn-outline">
+          Back to Cart
+        </Link>
+      </div>
+    </section>
+  );
+}
+
+
+src/pages/OrderDetailsPage.jsx (replace)
+/**
+ * Order details page: every product, quantity and price of one order, plus its status.
+ *
+ * - GET /api/orders/{id}: 403 (someone else's order) and 404 get a clear message.
+ * - "Payment Failed" order: the order is NOT confirmed. Two ways forward:
+ *     Retry Payment            -> POST /api/payments/process (same order, charged again)
+ *     Move items back to cart  -> POST /api/orders/{id}/return-to-cart (order Cancelled,
+ *                                 items back in the cart, change the cart, check out again)
+ * - "Cancelled" order: its items went back to the cart.
+ * - Cash on Delivery: confirmed, paid when delivered.
+ */
+import { useEffect, useState } from "react";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
+import { fetchOrder, retryPayment, returnToCart } from "../api/orderApi";
+import Alert, { errorText } from "../components/common/Alert";
+import Loader from "../components/common/Loader";
+import StatusBadge from "../components/common/StatusBadge";
+import OrderItemsTable from "../components/orders/OrderItemsTable";
+import { useCart } from "../context/CartContext";
+import { formatDate } from "../utils/format";
+
+export default function OrderDetailsPage() {
+  const { orderId } = useParams();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const { refreshCart } = useCart();
+  // The loaded order, remembered with the id it belongs to ("loading" = not loaded for this id yet).
+  const [result, setResult] = useState({ id: null, order: null, error: "" });
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState("");
+  const [justPaid, setJustPaid] = useState(false);
+
+  useEffect(() => {
+    let ignore = false;
+    fetchOrder(orderId)
+      .then((order) => !ignore && setResult({ id: orderId, order, error: "" }))
+      .catch((err) => {
+        if (ignore) return;
+        let error = errorText(err);
+        if (err.status === 403) error = "You can only view your own orders.";
+        if (err.status === 404) error = "Order not found.";
+        setResult({ id: orderId, order: null, error });
+      });
+    return () => {
+      ignore = true;
+    };
+  }, [orderId]);
+
+  const { order, error } = result;
+  if (result.id !== orderId) return <Loader text="Loading order..." />;
+  if (error || !order) {
+    return (
+      <section className="page narrow">
+        <Alert>{error || "Order not found."}</Alert>
+        <Link to="/orders">Back to order history</Link>
+      </section>
+    );
+  }
+
+  async function handleRetry() {
+    setBusy(true);
+    setActionError("");
+    try {
+      const paid = await retryPayment(order.id);
+      setResult({ id: orderId, order: paid, error: "" });
+      setJustPaid(true);
+    } catch (err) {
+      setActionError(errorText(err)); // 402 again, or 409 (an item went out of stock meanwhile)
+      try {
+        setResult({ id: orderId, order: await fetchOrder(order.id), error: "" }); // newest failure reason
+      } catch {
+        // keep showing the order we have
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleMoveToCart() {
+    setBusy(true);
+    setActionError("");
+    try {
+      await returnToCart(order.id);
+      await refreshCart(); // header badge + cart page show the returned items
+      navigate("/cart", { state: { message: `Items from order ${order.order_number} are back in your cart.` } });
+    } catch (err) {
+      setActionError(errorText(err));
+      setBusy(false);
+    }
+  }
+
+  const failed = order.status === "Payment Failed";
+  const confirmed = order.status === "Confirmed";
+  const cashOnDelivery = order.payment_method === "Cash on Delivery";
+
+  return (
+    <section className="page">
+      <Link to="/orders" className="back-link">
+        ← Back to order history
+      </Link>
+      <h1>Order {order.order_number}</h1>
+
+      {(location.state?.justPlaced || justPaid) && confirmed && (
+        <Alert type="success">
+          Thank you! Your order has been placed.{cashOnDelivery && " Please pay in cash when it is delivered."}
+        </Alert>
+      )}
+      {failed && (
+        <Alert type="error">
+          Payment failed: {order.failure_reason ?? "the payment could not be completed"}. This order is not confirmed.
+          Retry the payment, or move the items back to your cart to change your order.
+        </Alert>
+      )}
+      {order.status === "Cancelled" && (
+        <Alert type="info">This order was cancelled and its items were moved back to your cart.</Alert>
+      )}
+      <Alert>{actionError}</Alert>
+
+      <dl className="order-meta">
+        <dt>Date</dt>
+        <dd>{formatDate(order.created_at)}</dd>
+        <dt>Status</dt>
+        <dd>
+          <StatusBadge status={order.status} />
+        </dd>
+        <dt>Payment</dt>
+        <dd>
+          {order.payment_method && `${order.payment_method} · `}
+          <StatusBadge status={order.payment_status} />
+        </dd>
+        {order.payment_reference && (
+          <>
+            <dt>Reference</dt>
+            <dd>{order.payment_reference}</dd>
+          </>
+        )}
+      </dl>
+
+      <OrderItemsTable items={order.items} total={order.total_amount} />
+
+      {failed && (
+        <div className="form-actions">
+          <button type="button" className="btn btn-primary" onClick={handleRetry} disabled={busy}>
+            {busy ? "Please wait..." : "Retry Payment"}
+          </button>
+          <button type="button" className="btn btn-outline" onClick={handleMoveToCart} disabled={busy}>
+            Move items back to cart
+          </button>
+        </div>
+      )}
+    </section>
+  );
+}
+
+src/pages/CartPage.jsx
+1.
+ * - Shows a message passed by another page, e.g. "Items from order ... are back in your cart."
+
+2.
+import { Link, useLocation, useNavigate } from "react-router-dom";
+
+3.
+  const location = useLocation();
+
+4.
+      <h1>Your Cart</h1>
+      <Alert type="success">{location.state?.message}</Alert>
+      <Alert>{error}</Alert>
+
+
+src/App.jsx (replace)
+/**
+ * App: the routes. Every page renders inside <Layout> (Header + Main Content + Footer).
+ *
+ *   /                      home page                    (public)          <- Milestone 1
+ *   /register, /login                                   (public)          <- Milestone 1
+ *   /products              product listing + search     (public)          <- Milestone 2
+ *   /products/:productId   product details              (public)          <- Milestone 2
+ *   /cart                  the customer's cart          (customers only)  <- Milestone 3
+ *   /orders                my order history             (customers only)  <- Milestone 4
+ *   /orders/:orderId       one order's details          (customers only)  <- Milestone 4
+ *   /checkout              review and place the order   (customers only)  <- Milestone 5
+ */
+import { Route, Routes } from "react-router-dom";
+import ProtectedRoute from "./components/common/ProtectedRoute";
+import Layout from "./components/layout/Layout";
+import CartPage from "./pages/CartPage";
+import CheckoutPage from "./pages/CheckoutPage";
+import HomePage from "./pages/HomePage";
+import LoginPage from "./pages/LoginPage";
+import NotFoundPage from "./pages/NotFoundPage";
+import OrderDetailsPage from "./pages/OrderDetailsPage";
+import OrderHistoryPage from "./pages/OrderHistoryPage";
+import ProductDetailsPage from "./pages/ProductDetailsPage";
+import ProductListPage from "./pages/ProductListPage";
+import RegisterPage from "./pages/RegisterPage";
+
+const CUSTOMER_ONLY = ["customer"];
+
+/** Wrap a page so only logged-in customers can open it. */
+function customerPage(page) {
+  return <ProtectedRoute roles={CUSTOMER_ONLY}>{page}</ProtectedRoute>;
+}
+
+export default function App() {
+  return (
+    <Routes>
+      <Route element={<Layout />}>
+        <Route index element={<HomePage />} />
+        <Route path="register" element={<RegisterPage />} />
+        <Route path="login" element={<LoginPage />} />
+        <Route path="products" element={<ProductListPage />} />
+        <Route path="products/:productId" element={<ProductDetailsPage />} />
+        <Route path="cart" element={customerPage(<CartPage />)} />
+        <Route path="orders" element={customerPage(<OrderHistoryPage />)} />
+        <Route path="orders/:orderId" element={customerPage(<OrderDetailsPage />)} />
+        <Route path="checkout" element={customerPage(<CheckoutPage />)} />
+        <Route path="*" element={<NotFoundPage />} />
+      </Route>
+    </Routes>
+  );
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
