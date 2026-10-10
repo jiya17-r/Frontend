@@ -1,3 +1,16 @@
+
+docker compose exec db psql -U ecommerce -d ecommerceDB -c "SELECT id, username, email, full_name, role, is_active, created_at FROM users ORDER BY id;"
+
+docker compose exec db psql -U ecommerce -d ecommerceDB -c "SELECT id, username, email, role, created_at, CASE WHEN username IN ('priya','rahul','aman','kavya') THEN 'seed' ELSE 'registered' END AS source FROM users ORDER BY id;"
+
+docker compose exec db psql -U ecommerce -d ecommerceDB -c "SELECT a.created_at, u.username, u.email, a.request_id FROM audit_logs a JOIN users u ON u.id = a.actor_id WHERE a.action = 'register' ORDER BY a.created_at;"
+
+
+
+
+
+
+
 src/context/AuthContext.jsx (bug fix)
     fetchCurrentUser()
       .then(setUser)
