@@ -99,6 +99,10 @@ src/styles/global.css
 .product-initials { display: grid; place-items: center; }
 
 
+ALTER TABLE products ADD COLUMN image_url VARCHAR(500);
+UPDATE products SET image_url = '/images/products/' || lower(sku) || '.jpg';
+SELECT id, sku, image_url FROM products;
+\q
 
 
 
