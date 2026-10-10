@@ -1,0 +1,462 @@
+app/policy/endpoints.py (new)
+"""
+Endpoint catalog: every API endpoint and the policy rule that guards it.
+
+Student notes:
+- policy.csv speaks in (resource, action) pairs; people think in endpoints
+  ("POST /api/admin/products"). This list connects the two, so Swagger (/docs) can show
+  each role only the endpoints it may call.
+- access:
+    "public"     -> no token needed
+    "logged_in"  -> any valid token, every role
+    "policy"     -> decided by policy.csv through (resource, action)
+- Routes that are not in this list (the /demo routes) are shown to admins only.
+- tests/test_api_docs.py checks this list against the real routes, so a new endpoint
+  can't be forgotten here.
+"""
+
+from typing import NamedTuple
+
+
+class Endpoint(NamedTuple):
+    method: str
+    path: str
+    description: str
+    access: str  # "public" | "logged_in" | "policy"
+    resource: str | None = None
+    action: str | None = None
+
+
+ENDPOINTS: list[Endpoint] = [
+    # ---- Public ---------------------------------------------------------------------------
+    Endpoint("POST", "/api/auth/register", "Create a customer account", "public"),
+    Endpoint("POST", "/api/auth/login", "Log in and get tokens", "public"),
+    Endpoint("POST", "/api/auth/refresh", "Swap a refresh token for new tokens", "public"),
+    Endpoint("GET", "/api/products", "List active products", "public"),
+    Endpoint("GET", "/api/products/search", "Search products by name or category", "public"),
+    Endpoint("GET", "/api/products/{product_id}", "View one product", "public"),
+    Endpoint("GET", "/api/categories", "List categories", "public"),
+    Endpoint("GET", "/health", "Is the API running?", "public"),
+    Endpoint("GET", "/health/db", "Is the database reachable?", "public"),
+    Endpoint("GET", "/metrics", "Request statistics per route", "public"),
+    # ---- Any logged-in user ---------------------------------------------------------------
+    Endpoint("GET", "/api/auth/me", "Who am I?", "logged_in"),
+    # ---- Decided by policy.csv ------------------------------------------------------------
+    Endpoint("GET", "/api/cart", "View my cart", "policy", "cart", "read"),
+    Endpoint("POST", "/api/cart/add", "Add a product to my cart", "policy", "cart", "add"),
+    Endpoint("PUT", "/api/cart/update/{cart_item_id}", "Change a cart line's quantity", "policy", "cart", "update"),
+    Endpoint("DELETE", "/api/cart/remove/{cart_item_id}", "Remove a cart line", "policy", "cart", "remove"),
+    Endpoint("POST", "/api/orders/checkout", "Place an order from my cart", "policy", "orders", "checkout"),
+    Endpoint("GET", "/api/orders/me", "My order history", "policy", "orders", "read_own"),
+    Endpoint("GET", "/api/orders/{order_id}", "View one order", "policy", "orders", "read"),
+    Endpoint("POST", "/api/payments/process", "Retry a failed payment", "policy", "payments", "process"),
+    Endpoint(
+        "POST",
+        "/api/orders/{order_id}/return-to-cart",
+        "Move a failed order's items back to my cart",
+        "policy",
+        "orders",
+        "return_to_cart",
+    ),
+    Endpoint("POST", "/api/notifications/send", "Send a message to a customer", "policy", "notifications", "send"),
+    Endpoint("POST", "/api/admin/products", "Create a product", "policy", "products", "create"),
+    Endpoint("PUT", "/api/admin/products/{product_id}", "Update a product", "policy", "products", "update"),
+    Endpoint("DELETE", "/api/admin/products/{product_id}", "Deactivate a product", "policy", "products", "delete"),
+    Endpoint("POST", "/api/admin/categories", "Create a category", "policy", "categories", "create"),
+    Endpoint("PUT", "/api/admin/categories/{category_id}", "Update a category", "policy", "categories", "update"),
+    Endpoint("GET", "/api/admin/orders", "View all customers' orders", "policy", "orders", "list_all"),
+    Endpoint("GET", "/api/admin/audit-logs", "Read the audit log", "policy", "audit_logs", "read"),
+]
+
+
+app/policy/__init__.py
+
+- role_may_call() answers "may this role call this endpoint at all?" from the same
+  policy.csv. Swagger (/docs) uses it to show each role only its own endpoints, so what
+  users SEE always matches what is ENFORCED.
+
+from app.policy.endpoints import Endpoint
+
+
+
+def role_may_call(role: str | None, endpoint: Endpoint) -> bool:
+    """
+    May `role` call this endpoint at all? `role` is None for a visitor without a token.
+
+    public -> everyone; logged_in -> any role; policy -> the role has a rule for the
+    endpoint's (resource, action) in policy.csv. An ABAC rule ("only my own orders") still
+    counts as "may call": which RECORDS are allowed is decided per request.
+    """
+    if endpoint.access == "public":
+        return True
+    if role is None:
+        return False
+    if endpoint.access == "logged_in":
+        return True
+    return bool(enforcer.get_filtered_policy(0, role, endpoint.resource, endpoint.action))
+
+
+app/policy/openapi_filter.py
+"""
+Role-based Swagger: build the OpenAPI document (what /docs shows) for ONE role.
+
+Student notes:
+- FastAPI describes the API in one big dict, app.openapi():
+      {"paths": {"/api/cart": {"get": {...}}, ...}, "components": {"schemas": {...}}}
+  Swagger UI only draws what is in that dict. So to hide an endpoint from a role, we
+  remove it from a COPY of the dict before Swagger sees it.
+- Which endpoints a role keeps is decided by role_may_call(), i.e. by policy.csv, the same
+  rules that return 403. Hiding is only for clarity: the backend still enforces every rule,
+  so an endpoint someone calls by hand (curl, Postman) still answers 401/403.
+- Schemas (ProductCreate, OrderOut, ...) that only hidden endpoints use are removed too,
+  so a customer doesn't see admin request bodies at the bottom of the page.
+"""
+
+import copy
+
+from app.policy import role_may_call
+from app.policy.endpoints import ENDPOINTS
+
+HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
+CATALOG = {(e.method, e.path): e for e in ENDPOINTS}
+
+
+def openapi_for_role(full_schema: dict, role: str | None) -> dict:
+    """A copy of `full_schema` with only the operations `role` may call (None = no token)."""
+    schema = copy.deepcopy(full_schema)  # never change the app's cached original
+
+    kept_paths = {}
+    for path, operations in schema["paths"].items():
+        kept = {
+            method: operation
+            for method, operation in operations.items()
+            if method not in HTTP_METHODS or _visible(role, method, path)
+        }
+        if any(method in HTTP_METHODS for method in kept):
+            kept_paths[path] = kept
+    schema["paths"] = kept_paths
+
+    components = schema.get("components", {})
+    if "schemas" in components:
+        used = _used_schemas(kept_paths, components["schemas"])
+        components["schemas"] = {name: s for name, s in components["schemas"].items() if name in used}
+
+    who = role or "visitor (not logged in)"
+    schema["info"]["description"] = f"**Showing the endpoints for: {who}.** " + (
+        "Click **Authorize** and log in to see the endpoints of your role." if role is None else ""
+    )
+    return schema
+
+
+def _visible(role: str | None, method: str, path: str) -> bool:
+    endpoint = CATALOG.get((method.upper(), path))
+    if endpoint is None:
+        return role == "admin"  # not in the catalog (the /demo routes): admins only
+    return role_may_call(role, endpoint)
+
+
+def _used_schemas(paths: dict, all_schemas: dict) -> set[str]:
+    """Names of the schemas the kept paths refer to, directly or through other schemas."""
+    used: set[str] = set()
+    to_visit = _refs(paths)
+    while to_visit:
+        name = to_visit.pop()
+        if name in used or name not in all_schemas:
+            continue
+        used.add(name)
+        to_visit |= _refs(all_schemas[name])  # e.g. OrderOut -> OrderItemOut
+    return used
+
+
+def _refs(node: object) -> set[str]:
+    """Every "$ref": "#/components/schemas/<Name>" inside `node`, as a set of names."""
+    if isinstance(node, dict):
+        found = set()
+        for key, value in node.items():
+            if key == "$ref" and isinstance(value, str):
+                found.add(value.rsplit("/", 1)[-1])
+            else:
+                found |= _refs(value)
+        return found
+    if isinstance(node, list):
+        return set().union(*(_refs(item) for item in node)) if node else set()
+    return set()
+
+
+app/routes/dependencies.py
+1.
+# Same, but a missing token is allowed (None) instead of a 401: for pages visitors may see too.
+optional_oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
+
+2.
+
+
+async def get_optional_user(
+    token: Annotated[str | None, Depends(optional_oauth2_scheme)], service: AuthServiceDep
+) -> User | None:
+    """The logged-in user, or None without a token. A bad or expired token is still a 401."""
+    if token is None:
+        return None
+    return await service.get_user_from_token(token)
+
+
+OptionalUser = Annotated[User | None, Depends(get_optional_user)]
+
+app/routes/docs.py (new)
+"""
+Role-based Swagger UI: /docs shows each user only the endpoints their role may call.
+
+Student notes:
+- FastAPI's built-in /docs and /openapi.json are switched off in main.py (they show
+  everything to everyone). This router serves two replacements:
+      GET /docs                    the Swagger page (HTML + a little JavaScript)
+      GET /api/docs/openapi.json   the API description, FILTERED for the caller's role
+- How the page works:
+      1. It opens with no token -> the visitor view: public endpoints + login.
+      2. You click Authorize and log in -> the page asks /api/docs/openapi.json again,
+         now WITH your token -> the server answers with only your role's endpoints.
+      3. You click Logout -> back to the visitor view.
+- Hiding is for clarity, not security: every endpoint still checks the token and
+  policy.csv itself (401/403), whether it is visible here or not.
+- Both routes use include_in_schema=False: they are not API endpoints and are never listed.
+"""
+
+from fastapi import APIRouter, Request
+from fastapi.responses import HTMLResponse
+
+from app.policy.openapi_filter import openapi_for_role
+from app.routes.dependencies import OptionalUser
+
+router = APIRouter(tags=["Docs"])
+
+SWAGGER_UI = "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14"
+
+SWAGGER_PAGE = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ECommerce2 API - Swagger UI</title>
+  <link rel="stylesheet" href="{SWAGGER_UI}/swagger-ui.css">
+</head>
+<body>
+<div id="swagger-ui"></div>
+<script src="{SWAGGER_UI}/swagger-ui-bundle.js"></script>
+<script>
+  const SPEC_URL = "/api/docs/openapi.json";
+  let ready = false;       // the first (visitor) description has been drawn
+  let shownToken = null;   // the token the shown description was made for (null = visitor)
+  let lastRequest = 0;     // ignore answers to older requests
+
+  // The access token Swagger got from the Authorize dialog, or null.
+  function currentToken(system) {{
+    const authorized = system.authSelectors.authorized();
+    const schemes = authorized ? authorized.toJS() : {{}};
+    for (const scheme of Object.values(schemes)) {{
+      if (scheme && scheme.token && scheme.token.access_token) return scheme.token.access_token;
+    }}
+    return null;
+  }}
+
+  // Ask the server for the description of the current user's role and redraw.
+  async function showEndpointsForCurrentUser(system) {{
+    const token = currentToken(system);
+    if (!ready || token === shownToken) return;
+    shownToken = token;
+    const request = ++lastRequest;
+    let response = await fetch(SPEC_URL, {{ headers: token ? {{ Authorization: "Bearer " + token }} : {{}} }});
+    if (response.status === 401) response = await fetch(SPEC_URL); // expired token: visitor view
+    if (request === lastRequest) system.specActions.updateSpec(await response.text());
+  }}
+
+  // After every login (Authorize), logout or restored login, redraw for the new role.
+  function redrawAfter(action, system) {{
+    return (...args) => {{
+      const result = action(...args);
+      setTimeout(() => showEndpointsForCurrentUser(system), 0);
+      return result;
+    }};
+  }}
+  const RoleBasedDocsPlugin = () => ({{
+    statePlugins: {{
+      auth: {{
+        wrapActions: {{
+          authorize: redrawAfter,
+          authorizeOauth2: redrawAfter,
+          restoreAuthorization: redrawAfter,
+          logout: redrawAfter,
+        }},
+      }},
+    }},
+  }});
+
+  window.ui = SwaggerUIBundle({{
+    url: SPEC_URL,
+    dom_id: "#swagger-ui",
+    presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
+    layout: "BaseLayout",
+    plugins: [RoleBasedDocsPlugin],
+    persistAuthorization: true,  // stay logged in after a page refresh
+    onComplete: () => {{
+      ready = true;
+      showEndpointsForCurrentUser(window.ui);
+    }},
+  }});
+</script>
+</body>
+</html>
+"""
+
+
+@router.get("/docs", include_in_schema=False)
+async def swagger_page() -> HTMLResponse:
+    """The Swagger UI page. Which endpoints it shows depends on who logs in (Authorize)."""
+    return HTMLResponse(SWAGGER_PAGE)
+
+
+@router.get("/api/docs/openapi.json", include_in_schema=False)
+async def openapi_for_caller(request: Request, user: OptionalUser) -> dict:
+    """The API description with only the endpoints the caller's role may call (no token = visitor)."""
+    role = user.role.value if user else None
+    return openapi_for_role(request.app.openapi(), role)  # app.openapi(): the full description
+
+
+app/routes/__init__.py
+from app.routes.docs import router as docs_router
+
+
+app/main.py 
+    # The built-in docs show EVERY endpoint to everyone. They are replaced by role-based
+    # docs (routes/docs.py): /docs shows each role only the endpoints it may call.
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+
+app.include_router(docs_router)
+
+tests/test_api_docs.py (new)
+"""
+API tests for the role-based Swagger docs: /api/docs/openapi.json lists only the endpoints
+the caller's role may call, and the endpoint catalog (app/policy/endpoints.py) matches the
+real routes.
+"""
+
+import pytest
+
+from app.core.security import create_access_token
+from app.main import app
+from app.models import UserRole
+from app.policy.endpoints import ENDPOINTS
+from tests.conftest import create_user
+
+pytestmark = [pytest.mark.anyio, pytest.mark.integration]
+
+
+async def visible_endpoints(client, token: str | None = None) -> set[str]:
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    response = await client.get("/api/docs/openapi.json", headers=headers)
+    assert response.status_code == 200
+    return {
+        f"{method.upper()} {path}"
+        for path, operations in response.json()["paths"].items()
+        for method in operations
+        if method in {"get", "post", "put", "patch", "delete"}
+    }
+
+
+async def token_for(db, role: UserRole) -> str:
+    user = await create_user(db, f"docs_{role.value}", role)
+    return create_access_token(user.username)
+
+
+async def test_visitor_sees_only_public_endpoints(client):
+    endpoints = await visible_endpoints(client)
+
+    assert "POST /api/auth/login" in endpoints
+    assert "GET /api/products" in endpoints
+    assert "GET /api/auth/me" not in endpoints
+    assert "GET /api/cart" not in endpoints
+    assert "POST /api/admin/products" not in endpoints
+
+
+async def test_customer_sees_shopping_endpoints_only(client, db):
+    endpoints = await visible_endpoints(client, await token_for(db, UserRole.CUSTOMER))
+
+    assert {"GET /api/cart", "POST /api/orders/checkout", "POST /api/orders/{order_id}/return-to-cart"} <= endpoints
+    assert "GET /api/products" in endpoints  # public endpoints are shown to everyone
+    assert "POST /api/admin/products" not in endpoints
+    assert "GET /api/admin/orders" not in endpoints
+    assert "POST /api/notifications/send" not in endpoints
+
+
+async def test_support_sees_orders_and_notifications_but_no_cart_or_products(client, db):
+    endpoints = await visible_endpoints(client, await token_for(db, UserRole.SUPPORT))
+
+    assert {"GET /api/admin/orders", "GET /api/orders/{order_id}", "POST /api/notifications/send"} <= endpoints
+    assert "GET /api/cart" not in endpoints
+    assert "POST /api/admin/products" not in endpoints
+    assert "GET /api/admin/audit-logs" not in endpoints
+
+
+async def test_admin_sees_admin_endpoints_but_no_cart(client, db):
+    endpoints = await visible_endpoints(client, await token_for(db, UserRole.ADMIN))
+
+    assert {"POST /api/admin/products", "GET /api/admin/audit-logs", "GET /demo/sync-sleep"} <= endpoints
+    assert "POST /api/cart/add" not in endpoints
+    assert "POST /api/orders/checkout" not in endpoints
+
+
+async def test_unused_schemas_are_hidden_too(client, db):
+    response = await client.get(
+        "/api/docs/openapi.json", headers={"Authorization": f"Bearer {await token_for(db, UserRole.CUSTOMER)}"}
+    )
+    schemas = response.json()["components"]["schemas"]
+
+    assert "CartOut" in schemas
+    assert "OrderItemOut" in schemas  # used inside OrderOut
+    assert "ProductCreate" not in schemas  # only the admin's create-product endpoint uses it
+
+
+async def test_bad_token_is_401(client):
+    response = await client.get("/api/docs/openapi.json", headers={"Authorization": "Bearer not-a-token"})
+
+    assert response.status_code == 401
+
+
+async def test_full_description_is_not_public(client):
+    assert (await client.get("/openapi.json")).status_code == 404
+    assert (await client.get("/redoc")).status_code == 404
+    assert (await client.get("/docs")).status_code == 200  # the role-based page
+
+
+async def test_hidden_endpoints_are_still_protected(client, db):
+    """Hiding is for clarity: calling a hidden endpoint by hand is still refused."""
+    token = await token_for(db, UserRole.CUSTOMER)
+
+    response = await client.post(
+        "/api/admin/categories", json={"name": "Toys"}, headers={"Authorization": f"Bearer {token}"}
+    )
+
+    assert response.status_code == 403
+
+
+def test_catalog_matches_the_real_routes():
+    """Every catalog entry is a real route, and every real route is in the catalog."""
+    real = {
+        f"{method.upper()} {path}"
+        for path, operations in app.openapi()["paths"].items()
+        if not path.startswith("/demo")
+        for method in operations
+    }
+    catalog = {f"{e.method} {e.path}" for e in ENDPOINTS}
+
+    assert catalog - real == set(), "in the catalog but not a real route"
+    assert real - catalog == set(), "a route is missing from app/policy/endpoints.py"
+
+
+
+
+
+
+
+
