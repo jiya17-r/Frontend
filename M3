@@ -1,0 +1,620 @@
+src/context/AuthContext.jsx (bug fix)
+    fetchCurrentUser()
+      .then(setUser)
+      .catch((error) => {
+        // Only a real "your token is no good" answer ends the session. A network error (backend
+        // down, or the request cut off by a page reload) must NOT delete the stored tokens.
+        if (error.status === 401 || error.status === 403) logout();
+      })
+      .finally(() => setInitializing(false));
+
+
+src/context/CartContext.jsx (new)
+/**
+ * CartContext: the logged-in customer's cart, shared by the header badge, product cards,
+ * the cart page and checkout.
+ *
+ * The backend is the source of truth: every action calls the API and replaces the local
+ * cart with the cart the server returns (prices, totals and stock always come from the
+ * server, never calculated from what the user typed).
+ */
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import PropTypes from "prop-types";
+import { addToCart, fetchCart, removeCartItem, updateCartItem } from "../api/cartApi";
+import { useAuth } from "./AuthContext";
+
+const EMPTY_CART = { items: [], total_items: 0, total: 0 };
+
+const CartContext = createContext(null);
+
+export function CartProvider({ children }) {
+  const { isCustomer } = useAuth();
+  const [cart, setCart] = useState(EMPTY_CART);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const refreshCart = useCallback(async () => {
+    if (!isCustomer) {
+      setCart(EMPTY_CART);
+      return;
+    }
+    setLoading(true);
+    setError("");
+    try {
+      setCart(await fetchCart());
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [isCustomer]);
+
+  // Load the cart when a customer logs in.
+  useEffect(() => {
+    if (!isCustomer) return undefined;
+    let ignore = false;
+    fetchCart()
+      .then((loaded) => !ignore && setCart(loaded))
+      .catch((err) => !ignore && setError(err.message));
+    return () => {
+      ignore = true;
+    };
+  }, [isCustomer]);
+
+  // Each action returns the server's new cart; errors are thrown to the caller to display.
+  const addItem = useCallback(async (productId, quantity = 1) => {
+    const updated = await addToCart(productId, quantity);
+    setCart(updated);
+    return updated;
+  }, []);
+
+  const updateItem = useCallback(async (cartItemId, quantity) => {
+    const updated = await updateCartItem(cartItemId, quantity);
+    setCart(updated);
+    return updated;
+  }, []);
+
+  const removeItem = useCallback(
+    async (cartItemId) => {
+      await removeCartItem(cartItemId); // 204: no body, so reload the cart
+      await refreshCart();
+    },
+    [refreshCart],
+  );
+
+  // After logout nobody has a cart: show an empty one.
+  const visibleCart = isCustomer ? cart : EMPTY_CART;
+
+  const value = useMemo(
+    () => ({ cart: visibleCart, loading, error, refreshCart, addItem, updateItem, removeItem }),
+    [visibleCart, loading, error, refreshCart, addItem, updateItem, removeItem],
+  );
+
+  return <CartContext.Provider value={value}>{children}</CartContext.Provider>;
+}
+
+CartProvider.propTypes = {
+  children: PropTypes.node.isRequired,
+};
+
+export function useCart() {
+  const context = useContext(CartContext);
+  if (!context) throw new Error("useCart must be used inside <CartProvider>");
+  return context;
+}
+
+
+src/components/cart/CartItemRow.jsx (new)
+/**
+ * CartItemRow: one cart line - product, price, quantity input, subtotal, Remove.
+ *
+ * Quantity validation (case study): positive whole number, not above the available stock.
+ * An invalid value shows an error and is NOT sent. A valid change is sent to the backend
+ * 500 ms after the user stops typing; the totals then update from the server's answer.
+ */
+import { useEffect, useState } from "react";
+import PropTypes from "prop-types";
+import { formatPrice } from "../../utils/format";
+import { validateQuantity } from "../../utils/validators";
+import { errorText } from "../common/Alert";
+
+export default function CartItemRow({ item, onUpdate, onRemove }) {
+  const [quantity, setQuantity] = useState(String(item.quantity));
+  const [syncedQuantity, setSyncedQuantity] = useState(item.quantity);
+  const [busy, setBusy] = useState(false);
+  const [serverError, setServerError] = useState("");
+
+  const validationError = validateQuantity(quantity, item.stock);
+
+  // Keep the input in step when the server's quantity changes (e.g. after a re-load).
+  // (Adjusting state while rendering is React's recommended way; an effect would render twice.)
+  if (item.quantity !== syncedQuantity) {
+    setSyncedQuantity(item.quantity);
+    setQuantity(String(item.quantity));
+  }
+
+  // Debounced auto-save of a valid, changed quantity.
+  useEffect(() => {
+    if (validationError || Number(quantity) === item.quantity) return undefined;
+    const timer = setTimeout(async () => {
+      setBusy(true);
+      setServerError("");
+      try {
+        await onUpdate(item.id, Number(quantity));
+      } catch (error) {
+        setServerError(errorText(error));
+      } finally {
+        setBusy(false);
+      }
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [quantity, validationError, item.id, item.quantity, onUpdate]);
+
+  async function handleRemove() {
+    setBusy(true);
+    setServerError("");
+    try {
+      await onRemove(item.id);
+    } catch (error) {
+      setServerError(errorText(error));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <tr>
+      <td>
+        <span className="cart-product">{item.product_name}</span>
+        {!item.available && <span className="field-error">Not available in this quantity</span>}
+      </td>
+      <td>{formatPrice(item.unit_price)}</td>
+      <td>
+        <input
+          type="number"
+          min="1"
+          max={item.stock}
+          step="1"
+          className={validationError ? "input qty-input input-invalid" : "input qty-input"}
+          value={quantity}
+          onChange={(event) => setQuantity(event.target.value)}
+          aria-label={`Quantity of ${item.product_name}`}
+          disabled={busy}
+        />
+        {(validationError || serverError) && <p className="field-error">{validationError || serverError}</p>}
+      </td>
+      <td>{formatPrice(item.line_total)}</td>
+      <td>
+        <button type="button" className="btn btn-danger btn-small" onClick={handleRemove} disabled={busy}>
+          Remove
+        </button>
+      </td>
+    </tr>
+  );
+}
+
+export const cartItemShape = PropTypes.shape({
+  id: PropTypes.number.isRequired,
+  product_id: PropTypes.number.isRequired,
+  product_name: PropTypes.string.isRequired,
+  unit_price: PropTypes.number.isRequired,
+  quantity: PropTypes.number.isRequired,
+  stock: PropTypes.number.isRequired,
+  line_total: PropTypes.number.isRequired,
+  available: PropTypes.bool.isRequired,
+});
+
+CartItemRow.propTypes = {
+  item: cartItemShape.isRequired,
+  onUpdate: PropTypes.func.isRequired,
+  onRemove: PropTypes.func.isRequired,
+};
+
+
+src/components/cart/CartSummary.jsx (new)
+/** CartSummary: item count, total amount and the Checkout button (enabled only if the cart isn't empty). */
+import PropTypes from "prop-types";
+import { formatPrice } from "../../utils/format";
+
+export default function CartSummary({ totalItems, total, canCheckout, onCheckout }) {
+  return (
+    <div className="cart-summary">
+      <p>
+        Items: <strong>{totalItems}</strong>
+      </p>
+      <p className="cart-total">
+        Total: <strong>{formatPrice(total)}</strong>
+      </p>
+      <button type="button" className="btn btn-success" onClick={onCheckout} disabled={!canCheckout}>
+        Checkout
+      </button>
+    </div>
+  );
+}
+
+CartSummary.propTypes = {
+  totalItems: PropTypes.number.isRequired,
+  total: PropTypes.number.isRequired,
+  canCheckout: PropTypes.bool.isRequired,
+  onCheckout: PropTypes.func.isRequired,
+};
+
+
+src/components/common/ProtectedRoute.jsx (new)
+/**
+ * ProtectedRoute: wraps pages that need a logged-in user (cart, checkout, orders).
+ *
+ * - Still checking the stored token -> show a loader.
+ * - Not logged in -> go to /login, remembering where the user wanted to go.
+ * - Logged in with the wrong role (e.g. admin on the cart page) -> explain instead of
+ *   letting the backend answer 403 on every call. The backend still enforces this itself.
+ */
+import PropTypes from "prop-types";
+import { Navigate, useLocation } from "react-router-dom";
+import { useAuth } from "../../context/AuthContext";
+import Alert from "./Alert";
+import Loader from "./Loader";
+
+export default function ProtectedRoute({ children, roles }) {
+  const { user, initializing } = useAuth();
+  const location = useLocation();
+
+  if (initializing) return <Loader text="Checking your session..." />;
+  if (!user) return <Navigate to="/login" replace state={{ from: location.pathname }} />;
+  if (roles && !roles.includes(user.role)) {
+    return (
+      <section className="page narrow">
+        <Alert type="warning">
+          This page is for customer accounts. You are logged in as <strong>{user.role}</strong>.
+        </Alert>
+      </section>
+    );
+  }
+  return children;
+}
+
+ProtectedRoute.propTypes = {
+  children: PropTypes.node.isRequired,
+  roles: PropTypes.arrayOf(PropTypes.string),
+};
+
+
+
+
+src/pages/CartPage.jsx (new)
+/**
+ * Cart page: cart lines with quantity, price, Remove; total amount and Checkout.
+ *
+ * - Totals come from the backend after every change, so they always update automatically.
+ * - Checkout is enabled only if the cart is not empty (and every line is still available).
+ */
+import { useEffect } from "react";
+import { Link, useNavigate } from "react-router-dom";
+import Alert from "../components/common/Alert";
+import Loader from "../components/common/Loader";
+import CartItemRow from "../components/cart/CartItemRow";
+import CartSummary from "../components/cart/CartSummary";
+import { useCart } from "../context/CartContext";
+
+export default function CartPage() {
+  const { cart, loading, error, refreshCart, updateItem, removeItem } = useCart();
+  const navigate = useNavigate();
+
+  // Fresh prices and stock every time the page opens.
+  useEffect(() => {
+    refreshCart();
+  }, [refreshCart]);
+
+  const isEmpty = cart.items.length === 0;
+  const allAvailable = cart.items.every((item) => item.available);
+
+  if (loading && isEmpty) return <Loader text="Loading your cart..." />;
+
+  return (
+    <section className="page">
+      <h1>Your Cart</h1>
+      <Alert>{error}</Alert>
+
+      {isEmpty ? (
+        <p className="empty-state">
+          Your cart is empty. <Link to="/products">Browse products</Link>
+        </p>
+      ) : (
+        <>
+          <div className="table-wrap">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Product</th>
+                  <th>Price</th>
+                  <th>Qty</th>
+                  <th>Subtotal</th>
+                  <th aria-label="Actions" />
+                </tr>
+              </thead>
+              <tbody>
+                {cart.items.map((item) => (
+                  <CartItemRow key={item.id} item={item} onUpdate={updateItem} onRemove={removeItem} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {!allAvailable && (
+            <Alert type="warning">Some items are no longer available in that quantity. Update or remove them to check out.</Alert>
+          )}
+        </>
+      )}
+
+      <CartSummary
+        totalItems={cart.total_items}
+        total={cart.total}
+        canCheckout={!isEmpty && allAvailable}
+        onCheckout={() => navigate("/checkout")}
+      />
+    </section>
+  );
+}
+
+
+src/main.jsx (replace)
+/**
+ * Entry point: mounts React into <div id="root"> (index.html).
+ * Order of providers matters: CartProvider uses useAuth(), so it sits inside AuthProvider;
+ * both use routing hooks, so they sit inside BrowserRouter.
+ */
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import { BrowserRouter } from "react-router-dom";
+import App from "./App";
+import { AuthProvider } from "./context/AuthContext";
+import { CartProvider } from "./context/CartContext";
+import "./styles/global.css";
+
+createRoot(document.getElementById("root")).render(
+  <StrictMode>
+    <BrowserRouter>
+      <AuthProvider>
+        <CartProvider>
+          <App />
+        </CartProvider>
+      </AuthProvider>
+    </BrowserRouter>
+  </StrictMode>,
+);
+
+
+src/App.jsx (replace)
+/**
+ * App: the routes. Every page renders inside <Layout> (Header + Main Content + Footer).
+ *
+ *   /                      home page                    (public)          <- Milestone 1
+ *   /register, /login                                   (public)          <- Milestone 1
+ *   /products              product listing + search     (public)          <- Milestone 2
+ *   /products/:productId   product details              (public)          <- Milestone 2
+ *   /cart                  the customer's cart          (customers only)  <- Milestone 3
+ *   /checkout              placeholder until Milestone 5 (customers only)
+ */
+import { Link, Route, Routes } from "react-router-dom";
+import ProtectedRoute from "./components/common/ProtectedRoute";
+import Layout from "./components/layout/Layout";
+import CartPage from "./pages/CartPage";
+import HomePage from "./pages/HomePage";
+import LoginPage from "./pages/LoginPage";
+import NotFoundPage from "./pages/NotFoundPage";
+import ProductDetailsPage from "./pages/ProductDetailsPage";
+import ProductListPage from "./pages/ProductListPage";
+import RegisterPage from "./pages/RegisterPage";
+
+const CUSTOMER_ONLY = ["customer"];
+
+/** Wrap a page so only logged-in customers can open it. */
+function customerPage(page) {
+  return <ProtectedRoute roles={CUSTOMER_ONLY}>{page}</ProtectedRoute>;
+}
+
+/** Where the cart's Checkout button leads until the real checkout page (Milestone 5). */
+function CheckoutPlaceholder() {
+  return (
+    <section className="page narrow">
+      <h1>Checkout</h1>
+      <p className="muted">Order placement arrives in Milestone 5.</p>
+      <Link to="/cart">Back to cart</Link>
+    </section>
+  );
+}
+
+export default function App() {
+  return (
+    <Routes>
+      <Route element={<Layout />}>
+        <Route index element={<HomePage />} />
+        <Route path="register" element={<RegisterPage />} />
+        <Route path="login" element={<LoginPage />} />
+        <Route path="products" element={<ProductListPage />} />
+        <Route path="products/:productId" element={<ProductDetailsPage />} />
+        <Route path="cart" element={customerPage(<CartPage />)} />
+        <Route path="checkout" element={customerPage(<CheckoutPlaceholder />)} />
+        <Route path="*" element={<NotFoundPage />} />
+      </Route>
+    </Routes>
+  );
+}
+
+src/hooks/useAddToCart.js (replace)
+
+/**
+ * useAddToCart: what an "Add to Cart" button does, shared by the listing and details pages.
+ *
+ * - Guest -> send to the login page (and come back here afterwards). Returns false.
+ * - Logged in, but not a customer (admin/support) -> error: only customers have a cart.
+ * - Customer -> add through the CartContext (POST /api/cart/add). The context stores the
+ *   cart the server returns, so the header's cart badge updates at once. Returns true.
+ */
+import { useCallback } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { useAuth } from "../context/AuthContext";
+import { useCart } from "../context/CartContext";
+
+export function useAddToCart() {
+  const { isLoggedIn, isCustomer } = useAuth();
+  const { addItem } = useCart();
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  return useCallback(
+    async (product, quantity = 1) => {
+      if (!isLoggedIn) {
+        navigate("/login", { state: { from: location.pathname, message: "Please log in to add items to your cart." } });
+        return false;
+      }
+      if (!isCustomer) throw new Error("Only customer accounts can add items to a cart.");
+      await addItem(product.id, quantity);
+      return true;
+    },
+    [isLoggedIn, isCustomer, addItem, navigate, location.pathname],
+  );
+}
+
+
+src/components/layout/Header.jsx (replace)
+/**
+ * Header (top of every page): brand name, site navigation (Menu) and the profile icon.
+ * The profile icon opens a small menu: name, email and Logout (or Login/Register).
+ * Milestone 3: customers also see a cart icon with the number of items in the cart.
+ */
+import { useEffect, useRef, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
+import { useAuth } from "../../context/AuthContext";
+import { useCart } from "../../context/CartContext";
+import Icon from "../common/Icon";
+import Menu from "./Menu";
+
+export default function Header() {
+  const { user, isCustomer, logout } = useAuth();
+  const { cart } = useCart();
+  const navigate = useNavigate();
+  const [profileOpen, setProfileOpen] = useState(false);
+  const profileRef = useRef(null);
+
+  // Close the profile dropdown when the user clicks anywhere else.
+  useEffect(() => {
+    function handleClick(event) {
+      if (profileRef.current && !profileRef.current.contains(event.target)) setProfileOpen(false);
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, []);
+
+  function handleLogout() {
+    setProfileOpen(false);
+    logout();
+    navigate("/login");
+  }
+
+  return (
+    <header className="header">
+      <div className="container header-inner">
+        <Link to="/" className="brand">
+          <span className="brand-mark">A</span> ABC Shop
+        </Link>
+
+        <Menu />
+
+        <div className="header-actions">
+          {isCustomer && (
+            <Link to="/cart" className="icon-button" aria-label={`Cart, ${cart.total_items} items`}>
+              <Icon name="cart" />
+              {cart.total_items > 0 && <span className="cart-count">{cart.total_items}</span>}
+            </Link>
+          )}
+
+          <div className="profile" ref={profileRef}>
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="Profile"
+              aria-expanded={profileOpen}
+              onClick={() => setProfileOpen((open) => !open)}
+            >
+              <Icon name="user" />
+            </button>
+            {profileOpen && (
+              <div className="profile-menu">
+                {user ? (
+                  <>
+                    <p className="profile-name">{user.full_name}</p>
+                    <p className="profile-email">{user.email}</p>
+                    <button type="button" className="link-button" onClick={handleLogout}>
+                      Logout
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <Link to="/login" onClick={() => setProfileOpen(false)}>
+                      Login
+                    </Link>
+                    <Link to="/register" onClick={() => setProfileOpen(false)}>
+                      Register
+                    </Link>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </header>
+  );
+}
+
+
+src/components/layout/Menu.jsx (replace)
+
+/**
+ * Menu: links to the different sections of the app. NavLink highlights the current page.
+ * Milestone 1: Home, and Login/Register for logged-out users.
+ * Milestone 2: Products (also highlighted on a product's details page).
+ * Milestone 3: Cart, for logged-in customers.
+ */
+import { NavLink } from "react-router-dom";
+import { useAuth } from "../../context/AuthContext";
+
+const linkClass = ({ isActive }) => (isActive ? "menu-link active" : "menu-link");
+
+export default function Menu() {
+  const { isLoggedIn, isCustomer } = useAuth();
+
+  return (
+    <nav className="menu" aria-label="Main navigation">
+      <NavLink to="/" end className={linkClass}>
+        Home
+      </NavLink>
+      <NavLink to="/products" className={linkClass}>
+        Products
+      </NavLink>
+      {isCustomer && (
+        <NavLink to="/cart" className={linkClass}>
+          Cart
+        </NavLink>
+      )}
+      {!isLoggedIn && (
+        <>
+          <NavLink to="/login" className={linkClass}>
+            Login
+          </NavLink>
+          <NavLink to="/register" className={linkClass}>
+            Register
+          </NavLink>
+        </>
+      )}
+    </nav>
+  );
+}
+
+
+src/components/layout/Footer.jsx (one line)
+
+          <Link to="/">Home</Link>
+          <Link to="/products">All Products</Link>
+          <Link to="/cart">Cart</Link>
+          <Link to="/register">Register</Link>
+          <Link to="/login">Login</Link>
